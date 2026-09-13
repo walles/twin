@@ -270,6 +270,45 @@ func TestRenderLineFullWidth(t *testing.T) {
 		"ESC[mxyESC[K", "Expected clear-to-EOL at the end of a full-width line")
 }
 
+// The default, zero-value cursor state must render as hidden. This is what
+// Clear() resets the cursor to, and what a freshly created screen starts out
+// as.
+func TestRenderCursorLockedDefaultHidden(t *testing.T) {
+	screen := &terminalScreen{}
+
+	rendered := screen.renderCursorLocked(80, 24)
+	assert.Equal(t, rendered, "\x1b[?25l")
+}
+
+// A cursor shown within the screen's bounds must be positioned and made
+// visible.
+func TestRenderCursorLockedVisible(t *testing.T) {
+	screen := &terminalScreen{}
+	screen.cursor = cursorState{visible: true, column: 3, row: 5}
+
+	rendered := screen.renderCursorLocked(80, 24)
+
+	// CUP is 1-based, our column/row are 0-based.
+	assert.Equal(t, rendered, "\x1b[6;4H\x1b[?25h")
+}
+
+// A resize can shrink the screen between a ShowCursor() call and the next
+// render, leaving the requested coordinate outside the new bounds. Rather
+// than emit a CUP that could land outside the terminal, this must fall back
+// to hiding the cursor.
+func TestRenderCursorLockedOutOfBounds(t *testing.T) {
+	screen := &terminalScreen{}
+
+	screen.cursor = cursorState{visible: true, column: 80, row: 5}
+	assert.Equal(t, screen.renderCursorLocked(80, 24), "\x1b[?25l", "column out of bounds")
+
+	screen.cursor = cursorState{visible: true, column: 3, row: 24}
+	assert.Equal(t, screen.renderCursorLocked(80, 24), "\x1b[?25l", "row out of bounds")
+
+	screen.cursor = cursorState{visible: true, column: -1, row: 5}
+	assert.Equal(t, screen.renderCursorLocked(80, 24), "\x1b[?25l", "negative column")
+}
+
 // Test the most basic form of interruptability. Interrupting and sending a byte
 // should make the reader return EOF.
 //

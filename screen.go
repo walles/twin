@@ -61,7 +61,9 @@ type Screen interface {
 	Close()
 
 	// Erases all screen cells, replacing them with spaces in the default
-	// style.
+	// style. Also resets cursor visibility to hidden, the same as calling
+	// HideCursor(); call ShowCursor() again after Clear() if you want the
+	// cursor to keep showing.
 	//
 	// Like Size(), may apply a pending resize; see Size() for how that
 	// affects the rest of the frame.
@@ -82,6 +84,15 @@ type Screen interface {
 	//
 	// For out-of-bounds requests, a space with default style is returned.
 	GetCell(column int, row int) StyledRune
+
+	// ShowCursor places the terminal's real cursor at the given screen
+	// coordinate and makes it visible. Takes effect on the next Show() call.
+	ShowCursor(column int, row int)
+
+	// HideCursor hides the terminal's real cursor again. Takes effect on the
+	// next Show() call. This is the default state, and Clear() also resets to
+	// it.
+	HideCursor()
 
 	// Ask the terminal to show a progress bar
 	//
@@ -167,6 +178,10 @@ type terminalScreen struct {
 	// Progress bar state, sent to the terminal on every render. Guarded by
 	// renderLock.
 	progress Progress
+
+	// Cursor state, sent to the terminal on every render. Guarded by
+	// renderLock.
+	cursor cursorState
 
 	// True while we are on the alternate screen. Guarded by renderLock.
 	alternateScreenActive bool
@@ -363,11 +378,10 @@ func (screen *terminalScreen) setAlternateScreenModeLocked(enable bool) {
 }
 
 func (screen *terminalScreen) hideCursorLocked(hide bool) {
-	// Ref: https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
 	if hide {
-		screen.writeLocked("\x1b[?25l")
+		screen.writeLocked(cursorHideSeq)
 	} else {
-		screen.writeLocked("\x1b[?25h")
+		screen.writeLocked(cursorShowSeq)
 	}
 }
 
@@ -1009,6 +1023,13 @@ func (screen *terminalScreen) Clear() {
 	screen.freezeSizeForFrame()
 
 	clearCells(screen.cells)
+
+	// ShowCursor()/HideCursor() can be called from other goroutines (same as
+	// SetProgress() and screen.progress), so this specific write needs
+	// renderLock.
+	screen.renderLock.Lock()
+	screen.cursor = cursorState{}
+	screen.renderLock.Unlock()
 }
 
 // clearCells fills cells with spaces in the default style.
@@ -1125,18 +1146,82 @@ func renderLine(row []StyledRune, width int, terminalColorCount ColorCount) (str
 	return builder.String(), len(row)
 }
 
+// Render our contents onto the alternate screen. We switch there first if we
+// aren't already, and render nothing at all if we can't, because overwriting
+// the user's normal screen would destroy contents we have no way of restoring.
+// Owning the screen this way is also what makes the render cache trustworthy
+// enough to update only the lines that changed.
 func (screen *terminalScreen) Show() {
 	width, height := screen.Size()
 
-	const fullScreen = true
-	screen.showNLines(width, height, fullScreen)
+	screen.renderLock.Lock()
+	defer screen.renderLock.Unlock()
+
+	// The frame ends here, see freezeSizeForFrame().
+	defer func() { screen.inFrame = false }()
+
+	// Note that entering drops the render cache, so the delta check below
+	// correctly falls through to a full render the first time around.
+	screen.enterAlternateScreenSessionLocked()
+
+	if !screen.alternateScreenActive {
+		// Somebody else owns the terminal right now: we're either closed,
+		// or paused for an editor or for the shell after Ctrl-Z
+		return
+	}
+
+	screen.writeLocked(screen.renderProgressLocked())
+
+	if screen.showNLinesDeltaLocked(width, height) {
+		return
+	}
+
+	var builder strings.Builder
+
+	// Start in the top left corner:
+	// https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
+	builder.WriteString("\x1b[1;1H")
+
+	for row := range height {
+		renderWithNewline(&builder, screen.cells[row], width, screen.terminalColorCount, row == (height-1))
+	}
+
+	// This must come last, after all cell content: otherwise the
+	// content writes above would reposition the terminal's real cursor
+	// after we placed it here.
+	builder.WriteString(screen.renderCursorLocked(width, height))
+
+	// Write out what we have
+	screen.writeLocked(builder.String())
+	screen.snapshotLastRenderedLocked()
 }
 
+// Print the topmost height lines of our cells wherever the cursor happens to
+// be, like any other command line tool would. This is how ReprintAfterExit()
+// leaves moor's output behind on the user's own screen.
 func (screen *terminalScreen) PrintLines(height int) {
 	width, _ := screen.Size()
 
-	const fullScreen = false
-	screen.showNLines(width, height, fullScreen)
+	screen.renderLock.Lock()
+	defer screen.renderLock.Unlock()
+
+	// The frame ends here, see freezeSizeForFrame().
+	defer func() { screen.inFrame = false }()
+
+	screen.writeLocked(screen.renderProgressLocked())
+
+	var builder strings.Builder
+
+	for row := range height {
+		renderWithNewline(&builder, screen.cells[row], width, screen.terminalColorCount, row == (height-1))
+	}
+
+	// The last line can end with styling still set. Reset styling here to
+	// not mess up whatever will come after it, like a shell prompt.
+	builder.WriteString("\x1b[m")
+
+	// Write out what we have
+	screen.writeLocked(builder.String())
 }
 
 // Take a snapshot of the current screen. Will be used on the next render to
@@ -1227,7 +1312,9 @@ func renderWithNewline(builder *strings.Builder, line []StyledRune, width int, t
 
 // If only a few lines changed, update just those lines.
 //
-// You must hold renderLock when calling this method.
+// You must hold renderLock when calling this method. Only called from
+// Show(): it unconditionally renders cursor state, which must never happen
+// when printing plain lines onto the user's own screen.
 //
 // Returns true if delta rendering was done, false if a full render is needed.
 func (screen *terminalScreen) showNLinesDeltaLocked(width int, height int) bool {
@@ -1245,11 +1332,6 @@ func (screen *terminalScreen) showNLinesDeltaLocked(width int, height int) bool 
 		return false
 	}
 
-	if len(updatedLines) == 0 {
-		// Nothing to update, already done!
-		return true
-	}
-
 	var builder strings.Builder
 	for row, line := range updatedLines {
 		// Move cursor to the start of the line
@@ -1258,73 +1340,16 @@ func (screen *terminalScreen) showNLinesDeltaLocked(width int, height int) bool 
 		renderWithNewline(&builder, line, width, screen.terminalColorCount, row == (height-1))
 	}
 
+	// This must come last, after all cell content: otherwise the content
+	// writes above would reposition the terminal's real cursor after we
+	// placed it here.
+	builder.WriteString(screen.renderCursorLocked(width, height))
+
 	// Write out what we have
 	screen.writeLocked(builder.String())
 	screen.snapshotLastRenderedLocked()
 
 	return true
-}
-
-// Render the topmost height lines of our cells into the terminal.
-//
-// With fullScreen set, this frame is the whole terminal window: it goes on the
-// alternate screen, starting in the top left corner. We switch there first if
-// we aren't already, and render nothing at all if we can't, because overwriting
-// the user's normal screen would destroy contents we have no way of restoring.
-// Owning the screen is also what makes the render cache trustworthy enough to
-// update only the lines that changed.
-//
-// Without fullScreen we print height lines wherever the cursor happens to be,
-// like any other command line tool would. This is how ReprintAfterExit() leaves
-// moor's output behind on the user's own screen.
-func (screen *terminalScreen) showNLines(width int, height int, fullScreen bool) {
-	screen.renderLock.Lock()
-	defer screen.renderLock.Unlock()
-
-	// The frame ends here, see freezeSizeForFrame().
-	defer func() { screen.inFrame = false }()
-
-	if fullScreen {
-		// Note that entering drops the render cache, so the delta check below
-		// correctly falls through to a full render the first time around.
-		screen.enterAlternateScreenSessionLocked()
-
-		if !screen.alternateScreenActive {
-			// Somebody else owns the terminal right now: we're either closed,
-			// or paused for an editor or for the shell after Ctrl-Z
-			return
-		}
-	}
-
-	screen.writeLocked(screen.renderProgressLocked())
-
-	if fullScreen && screen.showNLinesDeltaLocked(width, height) {
-		return
-	}
-
-	var builder strings.Builder
-
-	if fullScreen {
-		// Start in the top left corner:
-		// https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
-		builder.WriteString("\x1b[1;1H")
-	}
-
-	for row := range height {
-		renderWithNewline(&builder, screen.cells[row], width, screen.terminalColorCount, row == (height-1))
-	}
-
-	if !fullScreen {
-		// The last line can end with a color still set. On the alternate screen
-		// leaving it restores the style, but here we are printing onto the
-		// user's own screen, so whatever we leave behind is what their next
-		// shell prompt gets rendered in.
-		builder.WriteString("\x1b[m")
-	}
-
-	// Write out what we have
-	screen.writeLocked(builder.String())
-	screen.snapshotLastRenderedLocked()
 }
 
 func (screen *terminalScreen) PauseAndCall(run func() error) error {
