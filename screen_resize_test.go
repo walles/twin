@@ -84,3 +84,16 @@ func TestClearKeepsSizeEstablishedByEarlierSizeCall(t *testing.T) {
 	screen.SetCell(19, 0, StyledRune{Rune: 'X', Style: StyleDefault})
 	assert.Equal(t, screen.GetCell(19, 0).Rune, rune('X'))
 }
+
+// Clear() is documented to reset cursor visibility to hidden, the same as
+// HideCursor(). This treats the cursor as just another piece of on-screen
+// decoration that gets wiped along with cell content.
+func TestClearHidesCursor(t *testing.T) {
+	screen, _ := newSizeTestScreen(20, 8)
+
+	screen.ShowCursor(3, 4)
+	assert.Assert(t, screen.cursor.visible)
+
+	screen.Clear()
+	assert.Assert(t, !screen.cursor.visible)
+}
