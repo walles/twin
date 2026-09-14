@@ -377,14 +377,6 @@ func (screen *terminalScreen) setAlternateScreenModeLocked(enable bool) {
 	}
 }
 
-func (screen *terminalScreen) hideCursorLocked(hide bool) {
-	if hide {
-		screen.writeLocked(cursorHideSeq)
-	} else {
-		screen.writeLocked(cursorShowSeq)
-	}
-}
-
 // Leave the alternate screen for good. Doing both under the same lock keeps a
 // concurrent Show() (the signal handler closes us while the pager goroutine is
 // still running) from putting us back on the alternate screen just as we exit.
@@ -414,7 +406,7 @@ func (screen *terminalScreen) enterAlternateScreenSessionLocked() {
 
 	screen.setAlternateScreenModeLocked(true)
 	screen.enableMouseTrackingLocked(screen.shouldEnableMouseTracking())
-	screen.hideCursorLocked(true)
+
 	screen.alternateScreenActive = true
 
 	// Clear the render cache to force a full redraw. This is needed after
@@ -434,7 +426,7 @@ func (screen *terminalScreen) leaveAlternateScreenSessionLocked() {
 	}
 
 	screen.writeLocked("\x1b[m")
-	screen.hideCursorLocked(false)
+	screen.writeLocked(cursorShowSeq)
 	screen.enableMouseTrackingLocked(false)
 	screen.setAlternateScreenModeLocked(false)
 	screen.alternateScreenActive = false
