@@ -309,6 +309,31 @@ func TestRenderCursorLockedOutOfBounds(t *testing.T) {
 	assert.Equal(t, screen.renderCursorLocked(80, 24), "\x1b[?25l", "negative column")
 }
 
+// PrintLines() writes onto the user's own shell screen, not the alternate
+// screen, so repositioning or showing the real cursor there would leave it in
+// the wrong place once the shell prompt comes back. It must never touch the
+// cursor, no matter what ShowCursor() last requested.
+func TestPrintLinesNeverTouchesCursor(t *testing.T) {
+	screen, _ := newSizeTestScreen(20, 8)
+
+	screen.Clear()
+	screen.SetCell(0, 0, StyledRune{Rune: 'X', Style: StyleDefault})
+	screen.ShowCursor(3, 4)
+
+	read, write, err := os.Pipe()
+	assert.NilError(t, err)
+	screen.ttyOut = write
+
+	screen.PrintLines(8)
+
+	assert.NilError(t, write.Close())
+	output, err := io.ReadAll(read)
+	assert.NilError(t, err)
+
+	assert.Assert(t, !strings.Contains(string(output), cursorHideSeq), "PrintLines() must never hide the cursor")
+	assert.Assert(t, !strings.Contains(string(output), cursorShowSeq), "PrintLines() must never show or reposition the cursor")
+}
+
 // Test the most basic form of interruptability. Interrupting and sending a byte
 // should make the reader return EOF.
 //
