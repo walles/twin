@@ -114,11 +114,6 @@ func (screen *FakeScreen) SetProgress(state ProgressState, percent int) {
 func (screen *FakeScreen) ShowCursor(column int, row int) {
 }
 
-// HideCursor does nothing, since a FakeScreen has no real terminal to show a
-// cursor on.
-func (screen *FakeScreen) HideCursor() {
-}
-
 // Show does nothing, since a FakeScreen has no real terminal to render into.
 func (screen *FakeScreen) Show() {
 }

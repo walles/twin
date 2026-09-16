@@ -9,7 +9,7 @@ const (
 )
 
 // cursorState is the terminal's real cursor position and visibility, set by
-// ShowCursor()/HideCursor() and sent to the terminal on every render.
+// ShowCursor() and sent to the terminal on every render.
 type cursorState struct {
 	visible bool
 	column  int
@@ -27,16 +27,6 @@ func (screen *terminalScreen) ShowCursor(column int, row int) {
 		column:  column,
 		row:     row,
 	}
-}
-
-// HideCursor hides the terminal's real cursor again. Takes effect on the next
-// Show() call, not immediately. This is the default state, and Clear() also
-// resets to it.
-func (screen *terminalScreen) HideCursor() {
-	screen.renderLock.Lock()
-	defer screen.renderLock.Unlock()
-
-	screen.cursor = cursorState{}
 }
 
 // renderCursorLocked returns the escape sequence needed to reposition and show

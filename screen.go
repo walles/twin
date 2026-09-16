@@ -60,13 +60,12 @@ type Screen interface {
 	// done with the screen returned by NewScreen().
 	Close()
 
-	// Erases all screen cells, replacing them with spaces in the default
-	// style. Also resets cursor visibility to hidden, the same as calling
-	// HideCursor(); call ShowCursor() again after Clear() if you want the
-	// cursor to keep showing.
+	// Erases all screen cells, replacing them with spaces in the default style.
+	// Also resets cursor visibility to hidden; call ShowCursor() again after
+	// Clear() if you want the cursor to keep showing.
 	//
-	// Like Size(), may apply a pending resize; see Size() for how that
-	// affects the rest of the frame.
+	// Like Size(), may apply a pending resize; see Size() for how that affects
+	// the rest of the frame.
 	Clear()
 
 	// Returns the width of the rune just added, in number of columns.
@@ -88,11 +87,6 @@ type Screen interface {
 	// ShowCursor places the terminal's real cursor at the given screen
 	// coordinate and makes it visible. Takes effect on the next Show() call.
 	ShowCursor(column int, row int)
-
-	// HideCursor hides the terminal's real cursor again. Takes effect on the
-	// next Show() call. This is the default state, and Clear() also resets to
-	// it.
-	HideCursor()
 
 	// Ask the terminal to show a progress bar
 	//
@@ -1016,9 +1010,8 @@ func (screen *terminalScreen) Clear() {
 
 	clearCells(screen.cells)
 
-	// ShowCursor()/HideCursor() can be called from other goroutines (same as
-	// SetProgress() and screen.progress), so this specific write needs
-	// renderLock.
+	// ShowCursor() can be called from other goroutines (same as SetProgress()
+	// and screen.progress), so this specific write needs renderLock.
 	screen.renderLock.Lock()
 	screen.cursor = cursorState{}
 	screen.renderLock.Unlock()
