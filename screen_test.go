@@ -42,10 +42,32 @@ func TestConsumeEncodedEvent(t *testing.T) {
 	assertEncode(t, "1234", EventRune{Rune: '1'}, "234")
 }
 
-func TestConsumeEncodedEventWithUnsupportedEscapeCode(t *testing.T) {
-	event, remainder := consumeEncodedEvent("\x1bXXXXX")
-	assert.Assert(t, event == nil)
-	assert.Equal(t, remainder, "")
+// Unsupported escape sequences should be dropped, but only those. Whatever comes
+// after them must survive.
+func assertDropsUnsupported(t *testing.T, unsupported string) {
+	t.Helper()
+	event, remainder := consumeEncodedEvent(unsupported + "q")
+
+	message := strings.ReplaceAll(unsupported, "\x1b", "ESC")
+	message = strings.ReplaceAll(message, "\x07", "BEL")
+
+	assert.Assert(t, event == nil, "Input: %s Result: %#v", message, event)
+	assert.Equal(t, remainder, "q", message)
+}
+
+func TestConsumeEncodedEventWithUnsupportedCSI(t *testing.T) {
+	// A cursor position report, as sent by the terminal in response to "\x1b[6n"
+	assertDropsUnsupported(t, "\x1b[12;40R")
+}
+
+func TestConsumeEncodedEventWithUnsupportedOSCBel(t *testing.T) {
+	// A terminal background color report, terminated by BEL
+	assertDropsUnsupported(t, "\x1b]11;rgb:1234/5678/9abc\x07")
+}
+
+func TestConsumeEncodedEventWithUnsupportedOSCST(t *testing.T) {
+	// A terminal background color report, terminated by ST
+	assertDropsUnsupported(t, "\x1b]11;rgb:1234/5678/9abc\x1b\\")
 }
 
 func TestConsumeEncodedEventWithNoInput(t *testing.T) {

@@ -272,12 +272,22 @@ func NewScreen(options Options) (Screen, error) {
 		screen.mainLoop()
 	}()
 
-	// Request terminal background color. The response will be handled in
-	// screen.mainLoop() that we just started ^.
-	//
-	// Ref:
-	// https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
-	//
+	// The response will be handled in screen.mainLoop() that we just started ^.
+	screen.queryTerminalBackground()
+
+	// NOTE: We deliberately do *not* enter the alternate screen here. That
+	// happens on the first Show(), so that a moor run that never paints
+	// anything leaves the terminal alone.
+
+	return &screen, nil
+}
+
+// Request terminal background color, and wait for the answer (or give up on
+// it). mainLoop() must be running, it's what handles the answer.
+//
+// Ref:
+// https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
+func (screen *terminalScreen) queryTerminalBackground() {
 	// Note the query timestamp before asking, so that mainLoop() can never
 	// observe an answer that arrived before we recorded asking for it.
 	screen.terminalBackgroundLock.Lock()
@@ -294,12 +304,6 @@ func NewScreen(options Options) (Screen, error) {
 	//
 	// Ref: https://github.com/walles/moor/issues/425
 	screen.TerminalBackground()
-
-	// NOTE: We deliberately do *not* enter the alternate screen here. That
-	// happens on the first Show(), so that a moor run that never paints
-	// anything leaves the terminal alone.
-
-	return &screen, nil
 }
 
 func (screen *terminalScreen) Close() {
