@@ -13,6 +13,7 @@ import (
 )
 
 func assertEncode(t *testing.T, incomingString string, expectedEvent Event, expectedRemainder string) {
+	t.Helper()
 	actualEvent, actualRemainder := consumeEncodedEvent(incomingString)
 
 	message := strings.ReplaceAll(incomingString, "\x1b", "ESC")

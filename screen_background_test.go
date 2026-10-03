@@ -12,7 +12,8 @@ import (
 // What a terminal with a 0x123456 background sends in response to "\x1b]11;?"
 const backgroundReply = "\x1b]11;rgb:1212/3434/5656\x07"
 
-// What a terminal sends in response to "\x1b[6n"
+// What a terminal with the cursor at row 12, column 40 sends in response to the
+// "\x1b[6n" cursor position query
 const cursorPositionReply = "\x1b[12;40R"
 
 // A screen with mainLoop() running, reading from a pipe instead of from a
@@ -21,6 +22,7 @@ const cursorPositionReply = "\x1b[12;40R"
 // Write to the returned terminal to fake terminal input. Read what the screen
 // wrote to the terminal using the returned output function.
 func newPipeTestScreen(t *testing.T) (screen *terminalScreen, terminal *os.File, output func() string) {
+	t.Helper()
 	ttyIn, terminal, err := os.Pipe()
 	assert.NilError(t, err)
 
@@ -43,6 +45,7 @@ func newPipeTestScreen(t *testing.T) (screen *terminalScreen, terminal *os.File,
 	})
 
 	output = func() string {
+		t.Helper()
 		bytes, err := os.ReadFile(ttyOut.Name())
 		assert.NilError(t, err)
 		return string(bytes)
@@ -52,12 +55,14 @@ func newPipeTestScreen(t *testing.T) (screen *terminalScreen, terminal *os.File,
 }
 
 func writeTerminal(t *testing.T, terminal *os.File, s string) {
+	t.Helper()
 	_, err := terminal.WriteString(s)
 	assert.NilError(t, err)
 }
 
 // Assert that the next event is a 'q' keypress, with nothing before it
 func assertNextEventIsQ(t *testing.T, screen *terminalScreen) {
+	t.Helper()
 	select {
 	case event := <-screen.events:
 		assert.Equal(t, event, Event(EventRune{Rune: 'q'}))
@@ -98,7 +103,11 @@ func TestTerminalBackgroundSlowAnswer(t *testing.T) {
 	assert.Equal(t, *background, NewColorHex(0x123456))
 }
 
-// Both replies should be consumed, without showing up as events
+// Both replies should be consumed, without showing up as events.
+//
+// To verify that, we send a 'q' after the replies, and check that it's the
+// first event we get. Any events caused by the replies would have shown up
+// before it.
 func TestTerminalBackgroundAnswerThenKey(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundReply+cursorPositionReply)
@@ -113,16 +122,16 @@ func TestTerminalBackgroundAnswerThenKey(t *testing.T) {
 	assertNextEventIsQ(t, screen)
 }
 
-// A terminal that doesn't support background color queries. The cursor
-// position reply should make us give up right away, rather than waiting for a
-// background color that's never coming.
+// A terminal that doesn't support background color queries. The cursor position
+// reply should make us give up right away, rather than waiting for a background
+// color that's never coming.
 func TestTerminalBackgroundNoAnswer(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, cursorPositionReply)
 
 	start := time.Now()
 	screen.queryTerminalBackground()
-	assert.Assert(t, time.Since(start) < 250*time.Millisecond, "Waited for %s", time.Since(start))
+	assert.Assert(t, time.Since(start) < 50*time.Millisecond, "Waited for %s", time.Since(start))
 
 	assert.Assert(t, screen.TerminalBackground() == nil)
 
@@ -137,7 +146,7 @@ func TestMainLoopKeyAfterUnsupportedSequence(t *testing.T) {
 
 	// Get the main loop past expecting answers to the background color query
 	writeTerminal(t, terminal, backgroundReply+cursorPositionReply)
-	time.Sleep(50 * time.Millisecond)
+	screen.queryTerminalBackground()
 
 	writeTerminal(t, terminal, cursorPositionReply+"q")
 	assertNextEventIsQ(t, screen)
