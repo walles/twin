@@ -71,6 +71,11 @@ func TestConsumeEncodedEventWithUnsupportedOSCST(t *testing.T) {
 	assertDropsUnsupported(t, "\x1b]11;rgb:1234/5678/9abc\x1b\\")
 }
 
+func TestConsumeEncodedEventWithUnsupportedMouseEvent(t *testing.T) {
+	// A left mouse button press
+	assertDropsUnsupported(t, "\x1b[<0;10;20M")
+}
+
 func TestConsumeEncodedEventWithNoInput(t *testing.T) {
 	event, remainder := consumeEncodedEvent("")
 	assert.Assert(t, event == nil)

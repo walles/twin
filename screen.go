@@ -664,8 +664,9 @@ func (screen *terminalScreen) mainLoop() {
 			event, encodedKeyCodeSequences = consumeEncodedEvent(encodedKeyCodeSequences)
 
 			if event == nil {
-				// No event, go wait for more
-				break
+				// Nothing to report, but there may be more after whatever was
+				// just consumed
+				continue
 			}
 
 			// Intercept Ctrl-Z and handle suspend/resume automatically
@@ -739,10 +740,10 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string) {
 		}
 
 		log.Debug(fmt.Sprint(
-			"Unhandled multi character mouse escape sequence(s): {",
-			humanizeLowASCII(encodedEventSequences),
+			"Unhandled mouse escape sequence: {",
+			humanizeLowASCII(mouseMatch[0]),
 			"}"))
-		return nil, ""
+		return nil, strings.TrimPrefix(encodedEventSequences, mouseMatch[0])
 	}
 
 	// No escape sequence prefix matched
@@ -752,6 +753,19 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string) {
 	}
 
 	if runes[0] == '\x1b' {
+		byteLength := escapeSequenceByteLength(encodedEventSequences)
+		if byteLength > 0 {
+			// Drop only this sequence, there could be more events after it.
+			//
+			// If this is a keypress, it should be added to
+			// escapeSequenceToKeyCode in keys.go.
+			log.Debug(fmt.Sprint(
+				"Unhandled terminal escape sequence: {",
+				humanizeLowASCII(encodedEventSequences[:byteLength]),
+				"}"))
+			return nil, encodedEventSequences[byteLength:]
+		}
+
 		if len(runes) != 1 {
 			// This means one or more sequences should be added to
 			// escapeSequenceToKeyCode in keys.go.
@@ -776,6 +790,44 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string) {
 	// Report the single rune
 	var event Event = EventRune{Rune: runes[0]}
 	return &event, string(runes[1:])
+}
+
+// Returns the length in bytes of the CSI or OSC escape sequence at the start of
+// s, or 0 if we can't tell where it ends.
+//
+// Ref: https://en.wikipedia.org/wiki/ANSI_escape_code#Fe_Escape_sequences
+func escapeSequenceByteLength(s string) int {
+	if strings.HasPrefix(s, "\x1b[") {
+		// CSI: Parameter and intermediate bytes, then a final byte
+		for i := 2; i < len(s); i++ {
+			if s[i] >= 0x40 && s[i] <= 0x7e {
+				return i + 1
+			}
+			if s[i] < 0x20 || s[i] > 0x3f {
+				// Not a valid parameter or intermediate byte
+				return 0
+			}
+		}
+		return 0
+	}
+
+	if strings.HasPrefix(s, "\x1b]") {
+		// OSC: A string terminated by either BEL or ST ("\x1b\\")
+		for i := 2; i < len(s); i++ {
+			if s[i] == '\x07' {
+				return i + 1
+			}
+			if s[i] == '\x1b' {
+				if i+1 < len(s) && s[i+1] == '\\' {
+					return i + 2
+				}
+				return 0
+			}
+		}
+		return 0
+	}
+
+	return 0
 }
 
 func (screen *terminalScreen) Size() (width int, height int) {
