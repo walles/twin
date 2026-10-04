@@ -13,7 +13,8 @@ import (
 )
 
 func assertEncode(t *testing.T, incomingString string, expectedEvent Event, expectedRemainder string) {
-	actualEvent, actualRemainder := consumeEncodedEvent(incomingString)
+	t.Helper()
+	actualEvent, actualRemainder, incomplete := consumeEncodedEvent(incomingString)
 
 	message := strings.ReplaceAll(incomingString, "\x1b", "ESC")
 	message = strings.ReplaceAll(message, "\r", "RET")
@@ -23,6 +24,7 @@ func assertEncode(t *testing.T, incomingString string, expectedEvent Event, expe
 	assert.Equal(t, *actualEvent, expectedEvent,
 		"Input: %s Result: %#v Expected: %#v", message, *actualEvent, expectedEvent)
 	assert.Equal(t, actualRemainder, expectedRemainder, message)
+	assert.Assert(t, !incomplete, message)
 }
 
 func TestConsumeEncodedEvent(t *testing.T) {
@@ -42,16 +44,45 @@ func TestConsumeEncodedEvent(t *testing.T) {
 	assertEncode(t, "1234", EventRune{Rune: '1'}, "234")
 }
 
-func TestConsumeEncodedEventWithUnsupportedEscapeCode(t *testing.T) {
-	event, remainder := consumeEncodedEvent("\x1bXXXXX")
-	assert.Assert(t, event == nil)
-	assert.Equal(t, remainder, "")
+// Unsupported escape sequences should be dropped, but only those. Whatever comes
+// after them must survive.
+func assertDropsUnsupported(t *testing.T, unsupported string) {
+	t.Helper()
+	event, remainder, incomplete := consumeEncodedEvent(unsupported + "q")
+
+	message := strings.ReplaceAll(unsupported, "\x1b", "ESC")
+	message = strings.ReplaceAll(message, "\x07", "BEL")
+
+	assert.Assert(t, event == nil, "Input: %s Result: %#v", message, event)
+	assert.Equal(t, remainder, "q", message)
+	assert.Assert(t, !incomplete, message)
+}
+
+func TestConsumeEncodedEventWithUnsupportedCSI(t *testing.T) {
+	// A "terminal OK" report, as sent by the terminal in response to "\x1b[5n"
+	assertDropsUnsupported(t, "\x1b[0n")
+}
+
+func TestConsumeEncodedEventWithUnsupportedOSCBel(t *testing.T) {
+	// A terminal foreground color report, terminated by BEL
+	assertDropsUnsupported(t, "\x1b]10;rgb:1234/5678/9abc\x07")
+}
+
+func TestConsumeEncodedEventWithUnsupportedOSCST(t *testing.T) {
+	// A terminal foreground color report, terminated by ST
+	assertDropsUnsupported(t, "\x1b]10;rgb:1234/5678/9abc\x1b\\")
+}
+
+func TestConsumeEncodedEventWithUnsupportedMouseEvent(t *testing.T) {
+	// A left mouse button press
+	assertDropsUnsupported(t, "\x1b[<0;10;20M")
 }
 
 func TestConsumeEncodedEventWithNoInput(t *testing.T) {
-	event, remainder := consumeEncodedEvent("")
+	event, remainder, incomplete := consumeEncodedEvent("")
 	assert.Assert(t, event == nil)
 	assert.Equal(t, remainder, "")
+	assert.Assert(t, !incomplete)
 }
 
 func TestRenderLine(t *testing.T) {

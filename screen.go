@@ -119,10 +119,10 @@ type Screen interface {
 	// frame.
 	Size() (width int, height int)
 
-	// The first call may delay up to 50ms while waiting for the terminal to
-	// respond to a background color query. After that, it's instant.
+	// The terminal's background color, as reported by the terminal during
+	// NewScreen().
 	//
-	// Can be nil if not (yet?) detected.
+	// nil if the terminal didn't report it.
 	TerminalBackground() *Color
 
 	// This channel is what your main loop should be checking.
@@ -164,6 +164,7 @@ type terminalScreen struct {
 
 	terminalBackground      *Color
 	terminalBackgroundQuery time.Time // When we asked for the terminal background color
+	terminalBackgroundDone  bool      // Set when done waiting for query responses
 	terminalBackgroundLock  sync.Mutex
 
 	cells        [][]StyledRune
@@ -215,6 +216,19 @@ type terminalScreen struct {
 //   - "41" is the row number on screen, "1" is the first row.
 //   - "M" marks the end of the mouse event.
 var mouseEventRegex = regexp.MustCompile("^\x1b\\[<([0-9]+);([0-9]+);([0-9]+)M")
+
+// Example response: "\x1b[12;40R", meaning the cursor is at row 12, column 40
+var cursorPositionResponseRegex = regexp.MustCompile("^\x1b\\[[0-9]+;[0-9]+R$")
+
+// Internal event, handled by processInput() and never posted: The terminal's
+// response to the background color query
+type eventTerminalBackground struct {
+	color Color
+}
+
+// Internal event, handled by processInput() and never posted: The terminal's
+// response to the cursor position query
+type eventCursorPosition struct{}
 
 // NewScreen creates a new Screen according to options. Passing the zero value
 // Options{} auto-detects mouse mode and terminal color count, and disables
@@ -272,28 +286,8 @@ func NewScreen(options Options) (Screen, error) {
 		screen.mainLoop()
 	}()
 
-	// Request terminal background color. The response will be handled in
-	// screen.mainLoop() that we just started ^.
-	//
-	// Ref:
-	// https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
-	//
-	// Note the query timestamp before asking, so that mainLoop() can never
-	// observe an answer that arrived before we recorded asking for it.
-	screen.terminalBackgroundLock.Lock()
-	screen.terminalBackgroundQuery = time.Now()
-	screen.terminalBackgroundLock.Unlock()
-
-	screen.renderLock.Lock()
-	screen.writeLocked("\x1b]11;?\x07")
-	screen.renderLock.Unlock()
-
-	// Wait for the background color answer (or give up on it) before returning.
-	// Callers want the color for styling their first frame, and waiting for it
-	// here means the wait happens while the user's terminal is still untouched.
-	//
-	// Ref: https://github.com/walles/moor/issues/425
-	screen.TerminalBackground()
+	// The response will be handled in screen.mainLoop() that we just started ^.
+	screen.queryTerminalBackground()
 
 	// NOTE: We deliberately do *not* enter the alternate screen here. That
 	// happens on the first Show(), so that a moor run that never paints
@@ -302,15 +296,71 @@ func NewScreen(options Options) (Screen, error) {
 	return &screen, nil
 }
 
-func (screen *terminalScreen) Close() {
-	// Wait for the terminal background color response to show up and consume
-	// it. Without this, if you Close() the screen too close to opening it, that
-	// escape sequence response will be printed as text in the user's terminal
-	// after exit.
-	//
-	// Ref: https://github.com/walles/moor/issues/380
-	screen.TerminalBackground()
+// Request terminal background color, and wait for the response (or give up on
+// it). mainLoop() must be running, it's what handles the response.
+//
+// Ref:
+// https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
+func (screen *terminalScreen) queryTerminalBackground() {
+	// Note the query timestamp before asking, so that mainLoop() can never
+	// observe a response that arrived before we recorded asking for it.
+	start := time.Now()
+	screen.terminalBackgroundLock.Lock()
+	screen.terminalBackgroundQuery = start
+	screen.terminalBackgroundLock.Unlock()
 
+	// Terminals answer queries in order, and practically all terminals answer
+	// the cursor position query. So we ask for the cursor position as an
+	// "end-of-message" marker.
+	//
+	// Ref: https://github.com/walles/moor/issues/53#issuecomment-3392572761
+	screen.renderLock.Lock()
+	const backgroundColorQuery = "\x1b]11;?\x07"
+	const cursorPositionQuery = "\x1b[6n"
+	screen.writeLocked(backgroundColorQuery + cursorPositionQuery)
+	screen.renderLock.Unlock()
+
+	// Wait for the background color response (or give up on it) before
+	// returning. Callers want the color for styling their first frame, and
+	// waiting for it here means the wait happens while the user's terminal is
+	// still untouched.
+	//
+	// Waiting here also means the responses have been consumed before anybody
+	// can Close() the screen. Otherwise they could be printed as text in the
+	// user's terminal after exit.
+	//
+	// Refs:
+	// * https://github.com/walles/moor/issues/425
+	// * https://github.com/walles/moor/issues/380
+	//
+	// Normally the wait ends as soon as the cursor position query is answered,
+	// with or without a background color response before it. This timeout is
+	// a backstop for terminals that answer neither query, which we don't
+	// expect to happen. Make it long enough to accommodate slow links.
+	const maxWait = 500 * time.Millisecond
+	for {
+		screen.terminalBackgroundLock.Lock()
+		if screen.terminalBackgroundDone {
+			screen.terminalBackgroundLock.Unlock()
+			return
+		}
+
+		if time.Since(start) > maxWait {
+			log.Info(fmt.Sprint("No terminal query responses after ", maxWait, ", giving up"))
+			screen.terminalBackgroundDone = true
+			screen.terminalBackgroundLock.Unlock()
+			return
+		}
+
+		// Unlock so mainLoop() can handle the responses
+		screen.terminalBackgroundLock.Unlock()
+
+		// It's not more urgent than this
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (screen *terminalScreen) Close() {
 	// Tell the pager to exit unless it hasn't already
 	screen.events <- EventExit{}
 
@@ -607,8 +657,7 @@ func (screen *terminalScreen) mainLoop() {
 	log.Info("Entering Twin main loop...")
 
 	maxBytesRead := 0
-	expectingTerminalBackgroundColor := true
-	var incompleteResponse []byte // To store incomplete terminal background color responses
+	incomplete := "" // Escape sequence split across reads
 	for {
 		count, err := screen.ttyInReader.Read(buffer)
 		if err != nil {
@@ -622,76 +671,91 @@ func (screen *terminalScreen) mainLoop() {
 			return
 		}
 
-		if expectingTerminalBackgroundColor {
-			incompleteResponse = append(incompleteResponse, buffer[:count]...)
-			// This is the response to our background color request
-			bg, valid := parseTerminalBgColorResponse(incompleteResponse)
-			if valid {
-				if bg != nil {
-					screen.terminalBackgroundLock.Lock()
-					screen.terminalBackground = bg
-					log.Debug(fmt.Sprint("Terminal background color detected as ", bg, " after ", time.Since(screen.terminalBackgroundQuery)))
-					screen.terminalBackgroundLock.Unlock()
-
-					expectingTerminalBackgroundColor = false
-					incompleteResponse = nil
-				}
-				continue
-			}
-
-			// Not valid, give up
-			expectingTerminalBackgroundColor = false
-			incompleteResponse = nil
-		}
-
 		if count > maxBytesRead {
 			maxBytesRead = count
 			log.Debug(fmt.Sprint("ttyin high watermark bumped to ", maxBytesRead, " bytes"))
 		}
 
-		encodedKeyCodeSequences := string(buffer[0:count])
-		if !utf8.ValidString(encodedKeyCodeSequences) {
-			log.Info(fmt.Sprint("Got invalid UTF-8 sequence on ttyin: ", encodedKeyCodeSequences))
+		incomplete = screen.processInput(incomplete + string(buffer[0:count]))
+	}
+}
+
+// Parse input into events and post them.
+//
+// Returns any incomplete escape sequence at the end of input. It should be
+// passed back in again together with the next input.
+func (screen *terminalScreen) processInput(input string) (incomplete string) {
+	if !utf8.ValidString(input) {
+		log.Info(fmt.Sprint("Got invalid UTF-8 sequence on ttyin: ", input))
+		return ""
+	}
+
+	for len(input) > 0 {
+		var event *Event
+		var isIncomplete bool
+		event, input, isIncomplete = consumeEncodedEvent(input)
+		if isIncomplete {
+			// Should be completed by the next input
+			return input
+		}
+
+		if event == nil {
+			// Nothing to report, but there may be more after whatever was
+			// just consumed
 			continue
 		}
 
-		for len(encodedKeyCodeSequences) > 0 {
-			var event *Event
-			event, encodedKeyCodeSequences = consumeEncodedEvent(encodedKeyCodeSequences)
-
-			if event == nil {
-				// No event, go wait for more
-				break
+		if background, ok := (*event).(eventTerminalBackground); ok {
+			screen.terminalBackgroundLock.Lock()
+			if screen.terminalBackgroundDone {
+				log.Info(fmt.Sprint("Got the terminal background color ", background.color, " after we stopped waiting for it, ignoring"))
+			} else {
+				screen.terminalBackground = &background.color
+				log.Debug(fmt.Sprint("Terminal background color detected as ", background.color, " after ", time.Since(screen.terminalBackgroundQuery)))
 			}
+			screen.terminalBackgroundLock.Unlock()
+			continue
+		}
 
-			// Intercept Ctrl-Z and handle suspend/resume automatically
-			if runeEvent, ok := (*event).(EventRune); ok {
-				if runeEvent.Rune == '\x1a' {
-					log.Info("Twin: Ctrl-Z detected, suspending...")
+		if _, ok := (*event).(eventCursorPosition); ok {
+			screen.terminalBackgroundLock.Lock()
+			if !screen.terminalBackgroundDone {
+				log.Debug(fmt.Sprint("Got the cursor position response after ", time.Since(screen.terminalBackgroundQuery), ", done waiting for terminal query responses"))
+				screen.terminalBackgroundDone = true
+			}
+			screen.terminalBackgroundLock.Unlock()
+			continue
+		}
 
-					err := screen.suspend()
-					if err != nil {
-						log.Info(fmt.Sprint("Twin: Suspend failed: ", err))
-						continue
-					}
+		// Intercept Ctrl-Z and handle suspend/resume automatically
+		if runeEvent, ok := (*event).(EventRune); ok {
+			if runeEvent.Rune == '\x1a' {
+				log.Info("Twin: Ctrl-Z detected, suspending...")
 
-					log.Info("Twin: Resumed from suspend")
-
+				err := screen.suspend()
+				if err != nil {
+					log.Info(fmt.Sprint("Twin: Suspend failed: ", err))
 					continue
 				}
-			}
 
-			// Post the event
-			select {
-			case screen.events <- *event:
-				// Yay
-			default:
-				// If this happens, consider increasing the channel size in
-				// NewScreen()
-				log.Info(fmt.Sprintf("Events buffer (size %d) full, events are being dropped", cap(screen.events)))
+				log.Info("Twin: Resumed from suspend")
+
+				continue
 			}
 		}
+
+		// Post the event
+		select {
+		case screen.events <- *event:
+			// Yay
+		default:
+			// If this happens, consider increasing the channel size in
+			// NewScreen()
+			log.Info(fmt.Sprintf("Events buffer (size %d) full, events are being dropped", cap(screen.events)))
+		}
 	}
+
+	return ""
 }
 
 // Turn ESC into <0x1b> and other low ASCII characters into <0xXX> for logging
@@ -708,11 +772,19 @@ func humanizeLowASCII(withLowAsciis string) string {
 	return humanized
 }
 
+// How long an incomplete escape sequence can get before we give up on it.
+//
+// The longest sequence we expect is a background color response terminated by
+// ST, like "\x1b]11;rgb:2828/2828/2828\x1b\\", at 25 bytes. This leaves room
+// for longer variants.
+const maxIncompleteSequenceLength = 64
+
 // Consume initial key code from the sequence of encoded keycodes.
 //
-// Returns a (possibly nil) event that should be posted, and the remainder of
-// the encoded events sequence.
-func consumeEncodedEvent(encodedEventSequences string) (*Event, string) {
+// Returns a (possibly nil) event that should be posted, the remainder of the
+// encoded events sequence, and whether the sequence starts with an incomplete
+// escape sequence. If it does, nothing is consumed.
+func consumeEncodedEvent(encodedEventSequences string) (*Event, string, bool) {
 	for singleKeyCodeSequence, keyCode := range escapeSequenceToKeyCode {
 		if !strings.HasPrefix(encodedEventSequences, singleKeyCodeSequence) {
 			continue
@@ -720,58 +792,159 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string) {
 
 		// Encoded key code sequence found, report it!
 		var event Event = EventKeyCode{keyCode}
-		return &event, strings.TrimPrefix(encodedEventSequences, singleKeyCodeSequence)
+		return &event, strings.TrimPrefix(encodedEventSequences, singleKeyCodeSequence), false
 	}
 
 	mouseMatch := mouseEventRegex.FindStringSubmatch(encodedEventSequences)
 	if mouseMatch != nil {
 		if mouseMatch[1] == "64" {
 			var event Event = EventMouse{Buttons: MouseWheelUp}
-			return &event, strings.TrimPrefix(encodedEventSequences, mouseMatch[0])
+			return &event, strings.TrimPrefix(encodedEventSequences, mouseMatch[0]), false
 		}
 		if mouseMatch[1] == "65" {
 			var event Event = EventMouse{Buttons: MouseWheelDown}
-			return &event, strings.TrimPrefix(encodedEventSequences, mouseMatch[0])
+			return &event, strings.TrimPrefix(encodedEventSequences, mouseMatch[0]), false
 		}
 
 		log.Debug(fmt.Sprint(
-			"Unhandled multi character mouse escape sequence(s): {",
-			humanizeLowASCII(encodedEventSequences),
+			"Unhandled mouse escape sequence: {",
+			humanizeLowASCII(mouseMatch[0]),
 			"}"))
-		return nil, ""
+		return nil, strings.TrimPrefix(encodedEventSequences, mouseMatch[0]), false
 	}
 
+	//
 	// No escape sequence prefix matched
+	//
+
 	runes := []rune(encodedEventSequences)
 	if len(runes) == 0 {
-		return nil, ""
-	}
-
-	if runes[0] == '\x1b' {
-		if len(runes) != 1 {
-			// This means one or more sequences should be added to
-			// escapeSequenceToKeyCode in keys.go.
-			log.Debug(fmt.Sprint(
-				"Unhandled multi character terminal escape sequence(s): {",
-				humanizeLowASCII(encodedEventSequences),
-				"}"))
-
-			// Mark everything as consumed since we don't know how to proceed otherwise.
-			return nil, ""
-		}
-
-		var event Event = EventKeyCode{KeyEscape}
-		return &event, string(runes[1:])
+		return nil, "", false
 	}
 
 	if runes[0] == '\r' {
 		var event Event = EventKeyCode{KeyEnter}
-		return &event, string(runes[1:])
+		return &event, string(runes[1:]), false
 	}
 
-	// Report the single rune
-	var event Event = EventRune{Rune: runes[0]}
-	return &event, string(runes[1:])
+	if runes[0] != '\x1b' {
+		// Report the single rune
+		var event Event = EventRune{Rune: runes[0]}
+		return &event, string(runes[1:]), false
+	}
+
+	//
+	// The first rune is ESC, but no known escape sequence matched. It could be
+	// the start of a longer escape sequence, or it could be a lone ESC keypress.
+	//
+
+	byteLength, incomplete := escapeSequenceByteLength(encodedEventSequences)
+	if incomplete {
+		if len(encodedEventSequences) > maxIncompleteSequenceLength {
+			// Probably not a sequence at all, but something like Alt-]
+			// followed by typing. Don't hold on to user input forever.
+			log.Info(fmt.Sprint(
+				"Giving up on incomplete escape sequence after ",
+				len(encodedEventSequences),
+				" bytes, dropping it: {",
+				humanizeLowASCII(encodedEventSequences),
+				"}"))
+			return nil, "", false
+		}
+
+		// Should be completed by more input
+		return nil, encodedEventSequences, true
+	}
+
+	if byteLength > 0 {
+		sequence := encodedEventSequences[:byteLength]
+
+		if background := parseTerminalBgColorResponse(sequence); background != nil {
+			var event Event = eventTerminalBackground{color: *background}
+			return &event, encodedEventSequences[byteLength:], false
+		}
+
+		if cursorPositionResponseRegex.MatchString(sequence) {
+			var event Event = eventCursorPosition{}
+			return &event, encodedEventSequences[byteLength:], false
+		}
+
+		// Drop only this sequence, there could be more events after it.
+		//
+		// If this is a keypress, it should be added to escapeSequenceToKeyCode
+		// in keys.go.
+		log.Debug(fmt.Sprint(
+			"Unhandled terminal escape sequence: {",
+			humanizeLowASCII(sequence),
+			"}"))
+		return nil, encodedEventSequences[byteLength:], false
+	}
+
+	if encodedEventSequences == "\x1b" {
+		var event Event = EventKeyCode{KeyEscape}
+		return &event, "", false
+	}
+
+	// This means one or more sequences should be added to
+	// escapeSequenceToKeyCode in keys.go.
+	log.Debug(fmt.Sprint(
+		"Unhandled multi character terminal escape sequence(s): {",
+		humanizeLowASCII(encodedEventSequences),
+		"}"))
+
+	// Mark everything as consumed since we don't know how to proceed otherwise.
+	return nil, "", false
+}
+
+// Returns the length in bytes of the CSI or OSC escape sequence at the start of
+// s, or 0 if s doesn't start with one.
+//
+// If s starts with an incomplete CSI or OSC sequence, incomplete will be true.
+//
+// Ref: https://en.wikipedia.org/wiki/ANSI_escape_code#Fe_Escape_sequences
+func escapeSequenceByteLength(s string) (byteLength int, incomplete bool) {
+	if strings.HasPrefix(s, "\x1b[") {
+		// CSI: Parameter and intermediate bytes, then a final byte
+		for i := 2; i < len(s); i++ {
+			if s[i] >= 0x40 && s[i] <= 0x7e {
+				// Final byte, '@' to '~'
+				return i + 1, false
+			}
+			if s[i] < 0x20 || s[i] > 0x3f {
+				// Not a valid parameter or intermediate byte, ' ' (space) to '?'
+				return 0, false
+			}
+		}
+		return 0, true
+	}
+
+	if strings.HasPrefix(s, "\x1b]") {
+		// OSC: A string terminated by either BEL or ST (ESC + backslash)
+		for i := 2; i < len(s); i++ {
+			if s[i] == '\x07' {
+				return i + 1, false
+			}
+			if s[i] == '\x1b' {
+				if i+1 == len(s) {
+					// Possibly the start of an ST
+					return 0, true
+				}
+				if s[i+1] == '\\' {
+					return i + 2, false
+				}
+				return 0, false
+			}
+			if s[i] < 0x20 {
+				// Control characters can't be part of an OSC sequence, so
+				// the sequence ends right before this one. This way a Ctrl-C
+				// after Alt-] ("\x1b]") still comes through.
+				return i, false
+			}
+		}
+		return 0, true
+	}
+
+	return 0, false
 }
 
 func (screen *terminalScreen) Size() (width int, height int) {
@@ -854,100 +1027,53 @@ func (screen *terminalScreen) applyPendingResize() {
 	screen.cells = newCells
 }
 
+// Nobody can call this until they got their Screen from NewScreen(). And
+// NewScreen() waits for background color to be populated. So this method only
+// has to take the lock and return the value.
 func (screen *terminalScreen) TerminalBackground() *Color {
-	const maxWait = 50 * time.Millisecond
-
-	// Is it already known?
-	screen.terminalBackgroundLock.Lock()
-	if screen.terminalBackground != nil || time.Since(screen.terminalBackgroundQuery) > maxWait {
-		// Either we know the color or we gave up waiting for it. Return it!
-		background := screen.terminalBackground
-		screen.terminalBackgroundLock.Unlock()
-		return background
-	}
-	screen.terminalBackgroundLock.Unlock()
-
-	// Wait at most 50ms in total for the background to be detected
-	screen.terminalBackgroundLock.Lock()
-	start := screen.terminalBackgroundQuery
-	screen.terminalBackgroundLock.Unlock()
-
-	for time.Since(start) < maxWait {
-		screen.terminalBackgroundLock.Lock()
-		if screen.terminalBackground != nil {
-			// There it is!
-			background := screen.terminalBackground
-			screen.terminalBackgroundLock.Unlock()
-			return background
-		}
-
-		// Unlock so the other goroutine can set it
-		screen.terminalBackgroundLock.Unlock()
-
-		// It's not more urgent than this
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// The wait is over, return whatever we have
 	screen.terminalBackgroundLock.Lock()
 	defer screen.terminalBackgroundLock.Unlock()
 	return screen.terminalBackground
 }
 
-func parseTerminalBgColorResponse(responseBytes []byte) (*Color, bool) {
+// Parses a complete terminal background color response, like
+// "\x1b]11;rgb:1212/3434/5656\x07". Returns nil if sequence isn't one.
+func parseTerminalBgColorResponse(sequence string) *Color {
 	prefix := "\x1b]11;rgb:"
-	suffix1 := "\x07"
-	suffix2 := "\x1b\\"
-	sampleResponse1 := prefix + "0000/0000/0000" + suffix1
-	sampleResponse2 := prefix + "0000/0000/0000" + suffix2
-
-	response := string(responseBytes)
-	if !strings.HasPrefix(response, prefix) {
-		log.Info(fmt.Sprint("Got unexpected prefix in bg color response from terminal: <", humanizeLowASCII(string(responseBytes)), ">"))
-		return nil, false // Invalid
+	if !strings.HasPrefix(sequence, prefix) {
+		return nil
 	}
-	response = strings.TrimPrefix(response, prefix)
+	rgb := strings.TrimPrefix(sequence, prefix)
+	rgb = strings.TrimSuffix(rgb, "\x07")
+	rgb = strings.TrimSuffix(rgb, "\x1b\\")
 
-	isComplete := strings.HasSuffix(response, suffix1) || strings.HasSuffix(response, suffix2)
-	if !isComplete && (len(responseBytes) < len(sampleResponse1) || len(responseBytes) < len(sampleResponse2)) {
-		log.Debug(fmt.Sprint("Terminal bg color response received so far: <", humanizeLowASCII(response), ">"))
-		return nil, true // Incomplete but valid
+	if len(rgb) != 14 {
+		log.Info(fmt.Sprint("Got unexpected length bg color response from terminal: <", humanizeLowASCII(sequence), ">"))
+		return nil
 	}
 
-	if !isComplete {
-		log.Info(fmt.Sprint("Got unexpected suffix in bg color response from terminal: <", humanizeLowASCII(string(responseBytes)), ">"))
-		return nil, false // Invalid
-	}
-	response = strings.TrimSuffix(response, suffix1)
-	response = strings.TrimSuffix(response, suffix2)
-
-	if len(response) != 14 {
-		log.Info(fmt.Sprint("Got unexpected length bg color response from terminal: <", humanizeLowASCII(string(responseBytes)), ">"))
-		return nil, false // Invalid
-	}
-
-	// response is now "RRRR/GGGG/BBBB"
-	red, err := strconv.ParseUint(response[0:4], 16, 16)
+	// rgb is now "RRRR/GGGG/BBBB"
+	red, err := strconv.ParseUint(rgb[0:4], 16, 16)
 	if err != nil {
-		log.Info(fmt.Sprint("Failed parsing red in bg color response from terminal: <", humanizeLowASCII(string(responseBytes)), ">: ", err))
-		return nil, false // Invalid
+		log.Info(fmt.Sprint("Failed parsing red in bg color response from terminal: <", humanizeLowASCII(sequence), ">: ", err))
+		return nil
 	}
 
-	green, err := strconv.ParseUint(response[5:9], 16, 16)
+	green, err := strconv.ParseUint(rgb[5:9], 16, 16)
 	if err != nil {
-		log.Info(fmt.Sprint("Failed parsing green in bg color response from terminal: <", humanizeLowASCII(string(responseBytes)), ">: ", err))
-		return nil, false // Invalid
+		log.Info(fmt.Sprint("Failed parsing green in bg color response from terminal: <", humanizeLowASCII(sequence), ">: ", err))
+		return nil
 	}
 
-	blue, err := strconv.ParseUint(response[10:14], 16, 16)
+	blue, err := strconv.ParseUint(rgb[10:14], 16, 16)
 	if err != nil {
-		log.Info(fmt.Sprint("Failed parsing blue in bg color response from terminal: <", humanizeLowASCII(string(responseBytes)), ">: ", err))
-		return nil, false // Invalid
+		log.Info(fmt.Sprint("Failed parsing blue in bg color response from terminal: <", humanizeLowASCII(sequence), ">: ", err))
+		return nil
 	}
 
 	color := NewColor24Bit(uint8(red/256), uint8(green/256), uint8(blue/256))
 
-	return &color, true // Valid
+	return &color
 }
 
 func (screen *terminalScreen) SetCell(column int, row int, styledRune StyledRune) int {
