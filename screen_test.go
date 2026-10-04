@@ -14,7 +14,7 @@ import (
 
 func assertEncode(t *testing.T, incomingString string, expectedEvent Event, expectedRemainder string) {
 	t.Helper()
-	actualEvent, actualRemainder := consumeEncodedEvent(incomingString)
+	actualEvent, actualRemainder, incomplete := consumeEncodedEvent(incomingString)
 
 	message := strings.ReplaceAll(incomingString, "\x1b", "ESC")
 	message = strings.ReplaceAll(message, "\r", "RET")
@@ -24,6 +24,7 @@ func assertEncode(t *testing.T, incomingString string, expectedEvent Event, expe
 	assert.Equal(t, *actualEvent, expectedEvent,
 		"Input: %s Result: %#v Expected: %#v", message, *actualEvent, expectedEvent)
 	assert.Equal(t, actualRemainder, expectedRemainder, message)
+	assert.Assert(t, !incomplete, message)
 }
 
 func TestConsumeEncodedEvent(t *testing.T) {
@@ -47,28 +48,29 @@ func TestConsumeEncodedEvent(t *testing.T) {
 // after them must survive.
 func assertDropsUnsupported(t *testing.T, unsupported string) {
 	t.Helper()
-	event, remainder := consumeEncodedEvent(unsupported + "q")
+	event, remainder, incomplete := consumeEncodedEvent(unsupported + "q")
 
 	message := strings.ReplaceAll(unsupported, "\x1b", "ESC")
 	message = strings.ReplaceAll(message, "\x07", "BEL")
 
 	assert.Assert(t, event == nil, "Input: %s Result: %#v", message, event)
 	assert.Equal(t, remainder, "q", message)
+	assert.Assert(t, !incomplete, message)
 }
 
 func TestConsumeEncodedEventWithUnsupportedCSI(t *testing.T) {
-	// A cursor position report, as sent by the terminal in response to "\x1b[6n"
-	assertDropsUnsupported(t, "\x1b[12;40R")
+	// A "terminal OK" report, as sent by the terminal in response to "\x1b[5n"
+	assertDropsUnsupported(t, "\x1b[0n")
 }
 
 func TestConsumeEncodedEventWithUnsupportedOSCBel(t *testing.T) {
-	// A terminal background color report, terminated by BEL
-	assertDropsUnsupported(t, "\x1b]11;rgb:1234/5678/9abc\x07")
+	// A terminal foreground color report, terminated by BEL
+	assertDropsUnsupported(t, "\x1b]10;rgb:1234/5678/9abc\x07")
 }
 
 func TestConsumeEncodedEventWithUnsupportedOSCST(t *testing.T) {
-	// A terminal background color report, terminated by ST
-	assertDropsUnsupported(t, "\x1b]11;rgb:1234/5678/9abc\x1b\\")
+	// A terminal foreground color report, terminated by ST
+	assertDropsUnsupported(t, "\x1b]10;rgb:1234/5678/9abc\x1b\\")
 }
 
 func TestConsumeEncodedEventWithUnsupportedMouseEvent(t *testing.T) {
@@ -77,9 +79,10 @@ func TestConsumeEncodedEventWithUnsupportedMouseEvent(t *testing.T) {
 }
 
 func TestConsumeEncodedEventWithNoInput(t *testing.T) {
-	event, remainder := consumeEncodedEvent("")
+	event, remainder, incomplete := consumeEncodedEvent("")
 	assert.Assert(t, event == nil)
 	assert.Equal(t, remainder, "")
+	assert.Assert(t, !incomplete)
 }
 
 func TestRenderLine(t *testing.T) {

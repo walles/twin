@@ -10,11 +10,11 @@ import (
 )
 
 // What a terminal with a 0x123456 background sends in response to "\x1b]11;?"
-const backgroundReply = "\x1b]11;rgb:1212/3434/5656\x07"
+const backgroundResponse = "\x1b]11;rgb:1212/3434/5656\x07"
 
 // What a terminal with the cursor at row 12, column 40 sends in response to the
 // "\x1b[6n" cursor position query
-const cursorPositionReply = "\x1b[12;40R"
+const cursorPositionResponse = "\x1b[12;40R"
 
 // A screen with mainLoop() running, reading from a pipe instead of from a
 // terminal.
@@ -75,7 +75,7 @@ func assertNextEventIsQ(t *testing.T, screen *terminalScreen) {
 // answer to the background color query.
 func TestTerminalBackgroundQueryAsksForCursorPosition(t *testing.T) {
 	screen, terminal, output := newPipeTestScreen(t)
-	writeTerminal(t, terminal, cursorPositionReply)
+	writeTerminal(t, terminal, cursorPositionResponse)
 
 	screen.queryTerminalBackground()
 
@@ -89,7 +89,7 @@ func TestTerminalBackgroundSlowAnswer(t *testing.T) {
 	go func() {
 		defer close(written)
 		time.Sleep(100 * time.Millisecond)
-		_, err := terminal.WriteString(backgroundReply + cursorPositionReply)
+		_, err := terminal.WriteString(backgroundResponse + cursorPositionResponse)
 		assert.Check(t, err)
 	}()
 
@@ -103,14 +103,14 @@ func TestTerminalBackgroundSlowAnswer(t *testing.T) {
 	assert.Equal(t, *background, NewColorHex(0x123456))
 }
 
-// Both replies should be consumed, without showing up as events.
+// Both responses should be consumed, without showing up as events.
 //
-// To verify that, we send a 'q' after the replies, and check that it's the
-// first event we get. Any events caused by the replies would have shown up
+// To verify that, we send a 'q' after the responses, and check that it's the
+// first event we get. Any events caused by the responses would have shown up
 // before it.
 func TestTerminalBackgroundAnswerThenKey(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
-	writeTerminal(t, terminal, backgroundReply+cursorPositionReply)
+	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
 
 	screen.queryTerminalBackground()
 
@@ -122,12 +122,12 @@ func TestTerminalBackgroundAnswerThenKey(t *testing.T) {
 	assertNextEventIsQ(t, screen)
 }
 
-// A terminal that doesn't support background color queries. The cursor position
-// reply should make us give up right away, rather than waiting for a background
-// color that's never coming.
+// A terminal that doesn't support background color queries. The cursor
+// position response should make us give up right away, rather than waiting for
+// a background color that's never coming.
 func TestTerminalBackgroundNoAnswer(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
-	writeTerminal(t, terminal, cursorPositionReply)
+	writeTerminal(t, terminal, cursorPositionResponse)
 
 	start := time.Now()
 	screen.queryTerminalBackground()
@@ -139,15 +139,135 @@ func TestTerminalBackgroundNoAnswer(t *testing.T) {
 	assertNextEventIsQ(t, screen)
 }
 
+// Keys typed before the responses arrive should be reported as usual, without
+// making us miss the responses.
+func TestTerminalBackgroundKeyFirst(t *testing.T) {
+	screen, terminal, _ := newPipeTestScreen(t)
+	writeTerminal(t, terminal, "q"+backgroundResponse+cursorPositionResponse)
+
+	screen.queryTerminalBackground()
+
+	background := screen.TerminalBackground()
+	assert.Assert(t, background != nil)
+	assert.Equal(t, *background, NewColorHex(0x123456))
+
+	assertNextEventIsQ(t, screen)
+}
+
 // After an unsupported escape sequence, the main loop must go on parsing
 // whatever comes after it.
 func TestMainLoopKeyAfterUnsupportedSequence(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 
 	// Get the main loop past expecting answers to the background color query
-	writeTerminal(t, terminal, backgroundReply+cursorPositionReply)
+	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
 	screen.queryTerminalBackground()
 
-	writeTerminal(t, terminal, cursorPositionReply+"q")
+	// A "terminal OK" report, which we never asked for
+	writeTerminal(t, terminal, "\x1b[0n"+"q")
 	assertNextEventIsQ(t, screen)
+}
+
+// A screen that isn't connected to any terminal, for testing processInput()
+func newInputTestScreen() *terminalScreen {
+	return &terminalScreen{events: make(chan Event, 10)}
+}
+
+// Assert that the screen has posted exactly these events, no more, no less
+func assertEvents(t *testing.T, screen *terminalScreen, expected ...Event) {
+	t.Helper()
+	var actual []Event
+	for len(screen.events) > 0 {
+		actual = append(actual, <-screen.events)
+	}
+	assert.DeepEqual(t, actual, expected)
+}
+
+// Responses can be split across reads
+func TestProcessInputSplitResponses(t *testing.T) {
+	screen := newInputTestScreen()
+
+	// Split in the middle of the background color response
+	incomplete := screen.processInput(backgroundResponse[:10])
+	assert.Equal(t, incomplete, backgroundResponse[:10])
+
+	// Split in the middle of the cursor position response
+	incomplete = screen.processInput(incomplete + backgroundResponse[10:] + cursorPositionResponse[:4])
+	assert.Equal(t, incomplete, cursorPositionResponse[:4])
+	assert.Assert(t, !screen.terminalBackgroundDone)
+
+	incomplete = screen.processInput(incomplete + cursorPositionResponse[4:] + "q")
+	assert.Equal(t, incomplete, "")
+	assert.Assert(t, screen.terminalBackgroundDone)
+
+	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x123456))
+	assertEvents(t, screen, EventRune{Rune: 'q'})
+}
+
+// A background color response terminated by ST, split between the ESC and the
+// backslash of the ST
+func TestProcessInputSplitST(t *testing.T) {
+	screen := newInputTestScreen()
+	response := strings.TrimSuffix(backgroundResponse, "\x07") + "\x1b\\"
+
+	incomplete := screen.processInput(response[:len(response)-1])
+	assert.Equal(t, incomplete, response[:len(response)-1])
+
+	incomplete = screen.processInput(incomplete + response[len(response)-1:] + cursorPositionResponse)
+	assert.Equal(t, incomplete, "")
+	assert.Assert(t, screen.terminalBackgroundDone)
+
+	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x123456))
+	assertEvents(t, screen)
+}
+
+// If the user types something before the responses arrive, we should get both
+// the keypress and the responses
+func TestProcessInputKeyFirst(t *testing.T) {
+	screen := newInputTestScreen()
+
+	incomplete := screen.processInput("q" + backgroundResponse + cursorPositionResponse)
+	assert.Equal(t, incomplete, "")
+	assert.Assert(t, screen.terminalBackgroundDone)
+
+	assert.Assert(t, screen.terminalBackground != nil)
+	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x123456))
+	assertEvents(t, screen, EventRune{Rune: 'q'})
+}
+
+// Once TerminalBackground() has given up waiting, late responses should be
+// ignored
+func TestProcessInputLateBackgroundResponse(t *testing.T) {
+	screen := newInputTestScreen()
+	screen.terminalBackgroundDone = true
+
+	incomplete := screen.processInput(backgroundResponse + cursorPositionResponse + "q")
+	assert.Equal(t, incomplete, "")
+
+	assert.Assert(t, screen.terminalBackground == nil)
+	assertEvents(t, screen, EventRune{Rune: 'q'})
+}
+
+// Mouse events can be split across reads as well, also after we're done with
+// the query responses
+func TestProcessInputSplitMouseEvent(t *testing.T) {
+	screen := newInputTestScreen()
+	screen.terminalBackgroundDone = true
+
+	incomplete := screen.processInput("\x1b[<64;10;2")
+	assert.Equal(t, incomplete, "\x1b[<64;10;2")
+	assertEvents(t, screen)
+
+	incomplete = screen.processInput(incomplete + "0Mq")
+	assert.Equal(t, incomplete, "")
+	assertEvents(t, screen, EventMouse{Buttons: MouseWheelUp}, EventRune{Rune: 'q'})
+}
+
+// A lone ESC is the Escape key, not the start of a split sequence
+func TestProcessInputLoneEscape(t *testing.T) {
+	screen := newInputTestScreen()
+
+	incomplete := screen.processInput("\x1b")
+	assert.Equal(t, incomplete, "")
+	assertEvents(t, screen, EventKeyCode{KeyCode: KeyEscape})
 }
