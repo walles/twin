@@ -276,3 +276,58 @@ func TestProcessInputLoneEscape(t *testing.T) {
 	assert.Equal(t, incomplete, "")
 	assertEvents(t, screen, EventKeyCode{KeyCode: KeyEscape})
 }
+
+// Windows Terminal with WSL has been seen delivering the background color
+// response in three pieces:
+// "\x1b]11;rgb:2828/28" + "28/2828" + "\x1b\\"
+//
+// We split it in four, for a margin of error.
+//
+// Ref: https://github.com/walles/moor/issues/271
+func TestProcessInputBackgroundResponseInFourPieces(t *testing.T) {
+	screen := newInputTestScreen()
+	response := "\x1b]11;rgb:2828/2828/2828\x1b\\"
+
+	incomplete := screen.processInput(response[:16])
+	incomplete = screen.processInput(incomplete + response[16:21])
+	incomplete = screen.processInput(incomplete + response[21:24])
+	incomplete = screen.processInput(incomplete + response[24:] + cursorPositionResponse)
+	assert.Equal(t, incomplete, "")
+	assert.Assert(t, screen.terminalBackgroundDone)
+
+	assert.Assert(t, screen.terminalBackground != nil)
+	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x282828))
+	assertEvents(t, screen)
+}
+
+// Alt-] sends "\x1b]", which looks like the start of an OSC sequence. Control
+// characters can't be part of an OSC sequence, so a Ctrl-C after it must come
+// through.
+func TestProcessInputUnterminatedOscThenCtrlC(t *testing.T) {
+	screen := newInputTestScreen()
+
+	incomplete := screen.processInput("\x1b]")
+	assert.Equal(t, incomplete, "\x1b]")
+
+	incomplete = screen.processInput(incomplete + "\x03")
+	assert.Equal(t, incomplete, "")
+	assertEvents(t, screen, EventRune{Rune: '\x03'})
+}
+
+// Text typed after Alt-] ("\x1b]") is valid OSC sequence content. We must give
+// up on it at some point, rather than hold all input forever.
+func TestProcessInputUnterminatedOscThenText(t *testing.T) {
+	screen := newInputTestScreen()
+
+	incomplete := screen.processInput("\x1b]")
+	for i := 0; i < 10 && incomplete != ""; i++ {
+		incomplete = screen.processInput(incomplete + "xxxxxxxxxxxxxxxx")
+	}
+
+	// The held sequence got too long, so we should have given up on it and
+	// dropped it
+	assert.Equal(t, len(incomplete), 0, "Still holding: %q", incomplete)
+
+	screen.processInput("q")
+	assertEvents(t, screen, EventRune{Rune: 'q'})
+}

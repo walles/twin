@@ -772,6 +772,13 @@ func humanizeLowASCII(withLowAsciis string) string {
 	return humanized
 }
 
+// How long an incomplete escape sequence can get before we give up on it.
+//
+// The longest sequence we expect is a background color response terminated by
+// ST, like "\x1b]11;rgb:2828/2828/2828\x1b\\", at 25 bytes. This leaves room
+// for longer variants.
+const maxIncompleteSequenceLength = 64
+
 // Consume initial key code from the sequence of encoded keycodes.
 //
 // Returns a (possibly nil) event that should be posted, the remainder of the
@@ -833,6 +840,18 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string, bool) {
 
 	byteLength, incomplete := escapeSequenceByteLength(encodedEventSequences)
 	if incomplete {
+		if len(encodedEventSequences) > maxIncompleteSequenceLength {
+			// Probably not a sequence at all, but something like Alt-]
+			// followed by typing. Don't hold on to user input forever.
+			log.Info(fmt.Sprint(
+				"Giving up on incomplete escape sequence after ",
+				len(encodedEventSequences),
+				" bytes, dropping it: {",
+				humanizeLowASCII(encodedEventSequences),
+				"}"))
+			return nil, "", false
+		}
+
 		// Should be completed by more input
 		return nil, encodedEventSequences, true
 	}
@@ -914,6 +933,12 @@ func escapeSequenceByteLength(s string) (byteLength int, incomplete bool) {
 					return i + 2, false
 				}
 				return 0, false
+			}
+			if s[i] < 0x20 {
+				// Control characters can't be part of an OSC sequence, so
+				// the sequence ends right before this one. This way a Ctrl-C
+				// after Alt-] ("\x1b]") still comes through.
+				return i, false
 			}
 		}
 		return 0, true
