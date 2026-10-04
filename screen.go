@@ -304,8 +304,9 @@ func NewScreen(options Options) (Screen, error) {
 func (screen *terminalScreen) queryTerminalBackground() {
 	// Note the query timestamp before asking, so that mainLoop() can never
 	// observe a response that arrived before we recorded asking for it.
+	start := time.Now()
 	screen.terminalBackgroundLock.Lock()
-	screen.terminalBackgroundQuery = time.Now()
+	screen.terminalBackgroundQuery = start
 	screen.terminalBackgroundLock.Unlock()
 
 	// Terminals answer queries in order, and practically all terminals answer
@@ -331,7 +332,32 @@ func (screen *terminalScreen) queryTerminalBackground() {
 	// Refs:
 	// * https://github.com/walles/moor/issues/425
 	// * https://github.com/walles/moor/issues/380
-	screen.TerminalBackground()
+	//
+	// Normally the wait ends as soon as the cursor position query is answered,
+	// with or without a background color response before it. This timeout is
+	// a backstop for terminals that answer neither query, which we don't
+	// expect to happen. Make it long enough to accommodate slow links.
+	const maxWait = 500 * time.Millisecond
+	for {
+		screen.terminalBackgroundLock.Lock()
+		if screen.terminalBackgroundDone {
+			screen.terminalBackgroundLock.Unlock()
+			return
+		}
+
+		if time.Since(start) > maxWait {
+			log.Info(fmt.Sprint("No terminal query responses after ", maxWait, ", giving up"))
+			screen.terminalBackgroundDone = true
+			screen.terminalBackgroundLock.Unlock()
+			return
+		}
+
+		// Unlock so mainLoop() can handle the responses
+		screen.terminalBackgroundLock.Unlock()
+
+		// It's not more urgent than this
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (screen *terminalScreen) Close() {
@@ -976,37 +1002,13 @@ func (screen *terminalScreen) applyPendingResize() {
 	screen.cells = newCells
 }
 
+// Nobody can call this until they got their Screen from NewScreen(). And
+// NewScreen() waits for background color to be populated. So this method only
+// has to take the lock and return the value.
 func (screen *terminalScreen) TerminalBackground() *Color {
-	// queryTerminalBackground() follows the background color query with a
-	// cursor position query. Normally the wait ends as soon as that one is
-	// answered, with or without a background color before it.
-	//
-	// This timeout is a backstop for terminals that answer neither query, which
-	// we don't expect to happen. Make it long enough to accommodate slow links.
-	const maxWait = 500 * time.Millisecond
-
-	for {
-		screen.terminalBackgroundLock.Lock()
-		if screen.terminalBackgroundDone {
-			background := screen.terminalBackground
-			screen.terminalBackgroundLock.Unlock()
-			return background
-		}
-
-		if time.Since(screen.terminalBackgroundQuery) > maxWait {
-			log.Info(fmt.Sprint("No terminal query responses after ", maxWait, ", giving up"))
-			screen.terminalBackgroundDone = true
-			background := screen.terminalBackground
-			screen.terminalBackgroundLock.Unlock()
-			return background
-		}
-
-		// Unlock so mainLoop() can handle the responses
-		screen.terminalBackgroundLock.Unlock()
-
-		// It's not more urgent than this
-		time.Sleep(5 * time.Millisecond)
-	}
+	screen.terminalBackgroundLock.Lock()
+	defer screen.terminalBackgroundLock.Unlock()
+	return screen.terminalBackground
 }
 
 // Parses a complete terminal background color response, like

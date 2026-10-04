@@ -240,7 +240,7 @@ func TestProcessInputKeyFirst(t *testing.T) {
 	assertEvents(t, screen, EventRune{Rune: 'q'})
 }
 
-// Once TerminalBackground() has given up waiting, late responses should be
+// Once queryTerminalBackground() has given up waiting, late responses should be
 // ignored
 func TestProcessInputLateBackgroundResponse(t *testing.T) {
 	screen := newInputTestScreen()
