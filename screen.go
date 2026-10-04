@@ -296,14 +296,14 @@ func NewScreen(options Options) (Screen, error) {
 	return &screen, nil
 }
 
-// Request terminal background color, and wait for the answer (or give up on
-// it). mainLoop() must be running, it's what handles the answer.
+// Request terminal background color, and wait for the response (or give up on
+// it). mainLoop() must be running, it's what handles the response.
 //
 // Ref:
 // https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
 func (screen *terminalScreen) queryTerminalBackground() {
 	// Note the query timestamp before asking, so that mainLoop() can never
-	// observe an answer that arrived before we recorded asking for it.
+	// observe a response that arrived before we recorded asking for it.
 	screen.terminalBackgroundLock.Lock()
 	screen.terminalBackgroundQuery = time.Now()
 	screen.terminalBackgroundLock.Unlock()
@@ -319,9 +319,10 @@ func (screen *terminalScreen) queryTerminalBackground() {
 	screen.writeLocked(backgroundColorQuery + cursorPositionQuery)
 	screen.renderLock.Unlock()
 
-	// Wait for the background color answer (or give up on it) before returning.
-	// Callers want the color for styling their first frame, and waiting for it
-	// here means the wait happens while the user's terminal is still untouched.
+	// Wait for the background color response (or give up on it) before
+	// returning. Callers want the color for styling their first frame, and
+	// waiting for it here means the wait happens while the user's terminal is
+	// still untouched.
 	//
 	// Waiting here also means the responses have been consumed before anybody
 	// can Close() the screen. Otherwise they could be printed as text in the
@@ -665,9 +666,9 @@ func (screen *terminalScreen) processInput(input string) (incomplete string) {
 
 	for len(input) > 0 {
 		var event *Event
-		var incomplete bool
-		event, input, incomplete = consumeEncodedEvent(input)
-		if incomplete {
+		var isIncomplete bool
+		event, input, isIncomplete = consumeEncodedEvent(input)
+		if isIncomplete {
 			// Should be completed by the next input
 			return input
 		}

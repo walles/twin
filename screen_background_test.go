@@ -71,8 +71,8 @@ func assertNextEventIsQ(t *testing.T, screen *terminalScreen) {
 	}
 }
 
-// The cursor position request is what tells us we can stop waiting for an
-// answer to the background color query.
+// The cursor position query is what tells us we can stop waiting for a
+// response to the background color query.
 func TestTerminalBackgroundQueryAsksForCursorPosition(t *testing.T) {
 	screen, terminal, output := newPipeTestScreen(t)
 	writeTerminal(t, terminal, cursorPositionResponse)
@@ -82,8 +82,8 @@ func TestTerminalBackgroundQueryAsksForCursorPosition(t *testing.T) {
 	assert.Assert(t, strings.Contains(output(), "\x1b]11;?\x07\x1b[6n"), humanizeLowASCII(output()))
 }
 
-// Slow links can take a while to answer. That's fine, as long as they answer.
-func TestTerminalBackgroundSlowAnswer(t *testing.T) {
+// Slow links can take a while to respond. That's fine, as long as they respond.
+func TestTerminalBackgroundSlowResponse(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	written := make(chan struct{})
 	go func() {
@@ -96,7 +96,12 @@ func TestTerminalBackgroundSlowAnswer(t *testing.T) {
 	// Cleanups run last-registered-first, so this runs before the pipe closes
 	t.Cleanup(func() { <-written })
 
+	start := time.Now()
 	screen.queryTerminalBackground()
+
+	// Well below the 500ms backstop, so we know it was the cursor position
+	// response that ended the wait
+	assert.Assert(t, time.Since(start) < 400*time.Millisecond, "Waited for %s", time.Since(start))
 
 	background := screen.TerminalBackground()
 	assert.Assert(t, background != nil)
@@ -108,7 +113,7 @@ func TestTerminalBackgroundSlowAnswer(t *testing.T) {
 // To verify that, we send a 'q' after the responses, and check that it's the
 // first event we get. Any events caused by the responses would have shown up
 // before it.
-func TestTerminalBackgroundAnswerThenKey(t *testing.T) {
+func TestTerminalBackgroundResponsesThenKey(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
 
@@ -125,7 +130,7 @@ func TestTerminalBackgroundAnswerThenKey(t *testing.T) {
 // A terminal that doesn't support background color queries. The cursor
 // position response should make us give up right away, rather than waiting for
 // a background color that's never coming.
-func TestTerminalBackgroundNoAnswer(t *testing.T) {
+func TestTerminalBackgroundNoBackgroundResponse(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, cursorPositionResponse)
 
@@ -159,7 +164,7 @@ func TestTerminalBackgroundKeyFirst(t *testing.T) {
 func TestMainLoopKeyAfterUnsupportedSequence(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 
-	// Get the main loop past expecting answers to the background color query
+	// Get the main loop past expecting responses to the background color query
 	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
 	screen.queryTerminalBackground()
 
