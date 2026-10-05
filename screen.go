@@ -167,6 +167,10 @@ type terminalScreen struct {
 	terminalBackgroundDone  bool      // Set when done waiting for query responses
 	terminalBackgroundLock  sync.Mutex
 
+	// Whether the terminal supports Alternate Scroll Mode. Guarded by
+	// terminalBackgroundLock.
+	alternateScroll alternateScrollSupport
+
 	cells        [][]StyledRune
 	lastRendered lastRendered // Kept up to date by snapshotLastRendered()
 
@@ -229,6 +233,20 @@ type eventTerminalBackground struct {
 // Internal event, handled by processInput() and never posted: The terminal's
 // response to the cursor position query
 type eventCursorPosition struct{}
+
+// Alternate Scroll Mode makes the terminal send the mouse wheel as arrow keys
+// while on the alternate screen
+//
+// Ref: https://github.com/walles/moor/issues/53#issuecomment-3392572761
+type alternateScrollSupport int
+
+const (
+	// The terminal didn't respond to our query
+	alternateScrollUnknown alternateScrollSupport = iota
+
+	alternateScrollSupported
+	alternateScrollUnsupported
+)
 
 // NewScreen creates a new Screen according to options. Passing the zero value
 // Options{} auto-detects mouse mode and terminal color count, and disables
