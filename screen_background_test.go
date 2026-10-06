@@ -77,13 +77,17 @@ func assertNextEventIsQ(t *testing.T, screen *terminalScreen) {
 
 // The cursor position query goes last. Its response is what tells us we can
 // stop waiting for responses to the other queries.
-func TestTerminalBackgroundQueryAsksForCursorPosition(t *testing.T) {
+//
+// Alternate Scroll Mode should only be queried, not enabled. We enable it when
+// entering the alternate screen.
+func TestTerminalBackgroundQueries(t *testing.T) {
 	screen, terminal, output := newPipeTestScreen(t)
 	writeTerminal(t, terminal, cursorPositionResponse)
 
 	screen.queryTerminalBackground()
 
 	assert.Assert(t, strings.Contains(output(), "\x1b]11;?\x07\x1b[?1007$p\x1b[6n"), humanizeLowASCII(output()))
+	assert.Assert(t, !strings.Contains(output(), "\x1b[?1007h"), humanizeLowASCII(output()))
 }
 
 // Slow links can take a while to respond. That's fine, as long as they respond.
@@ -148,7 +152,8 @@ func TestTerminalBackgroundNoBackgroundResponse(t *testing.T) {
 	assertNextEventIsQ(t, screen)
 }
 
-// All three responses should be consumed, without showing up as events
+// The Alternate Scroll Mode status should be stored, and all three responses
+// consumed without showing up as events
 func TestTerminalBackgroundAlternateScrollResponse(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundResponse+alternateScrollOffResponse+cursorPositionResponse)
@@ -406,6 +411,7 @@ func TestProcessInputOtherModeResponse(t *testing.T) {
 	assertEvents(t, screen, EventRune{Rune: 'q'})
 }
 
+// The DECRQM response can be split across reads
 func TestProcessInputSplitAlternateScrollResponse(t *testing.T) {
 	screen := newInputTestScreen()
 

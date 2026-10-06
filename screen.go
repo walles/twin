@@ -234,14 +234,15 @@ type eventTerminalBackground struct {
 // response to the cursor position query
 type eventCursorPosition struct{}
 
-// Alternate Scroll Mode makes the terminal send the mouse wheel as arrow keys
-// while on the alternate screen
+// Whether the terminal supports Alternate Scroll Mode (1007), which makes the
+// terminal send the mouse wheel as arrow keys while on the alternate screen
 //
 // Ref: https://github.com/walles/moor/issues/53#issuecomment-3392572761
 type alternateScrollSupport int
 
 const (
-	// The terminal didn't respond to our query
+	// We don't know: no response before the cursor position response, or a
+	// status we don't understand
 	alternateScrollUnknown alternateScrollSupport = iota
 
 	alternateScrollSupported
