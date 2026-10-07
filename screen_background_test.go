@@ -84,7 +84,7 @@ func TestTerminalBackgroundQueries(t *testing.T) {
 	screen, terminal, output := newPipeTestScreen(t)
 	writeTerminal(t, terminal, cursorPositionResponse)
 
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 
 	assert.Assert(t, strings.Contains(output(), "\x1b]11;?\x07\x1b[?1007$p\x1b[6n"), humanizeLowASCII(output()))
 	assert.Assert(t, !strings.Contains(output(), "\x1b[?1007h"), humanizeLowASCII(output()))
@@ -105,7 +105,7 @@ func TestTerminalBackgroundSlowResponse(t *testing.T) {
 	t.Cleanup(func() { <-written })
 
 	start := time.Now()
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 
 	// Well below the 500ms backstop, so we know it was the cursor position
 	// response that ended the wait
@@ -125,7 +125,7 @@ func TestTerminalBackgroundResponsesThenKey(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
 
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 
 	background := screen.TerminalBackground()
 	assert.Assert(t, background != nil)
@@ -143,7 +143,7 @@ func TestTerminalBackgroundNoBackgroundResponse(t *testing.T) {
 	writeTerminal(t, terminal, cursorPositionResponse)
 
 	start := time.Now()
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 	assert.Assert(t, time.Since(start) < 50*time.Millisecond, "Waited for %s", time.Since(start))
 
 	assert.Assert(t, screen.TerminalBackground() == nil)
@@ -158,11 +158,11 @@ func TestTerminalBackgroundAlternateScrollResponse(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundResponse+alternateScrollOffResponse+cursorPositionResponse)
 
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 
-	screen.terminalBackgroundLock.Lock()
-	alternateScroll := screen.alternateScroll
-	screen.terminalBackgroundLock.Unlock()
+	screen.terminalQueryLock.Lock()
+	alternateScroll := screen.terminalAlternateScroll
+	screen.terminalQueryLock.Unlock()
 	assert.Equal(t, alternateScroll, alternateScrollSupported)
 
 	writeTerminal(t, terminal, "q")
@@ -175,7 +175,7 @@ func TestTerminalBackgroundKeyFirst(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, "q"+backgroundResponse+cursorPositionResponse)
 
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 
 	background := screen.TerminalBackground()
 	assert.Assert(t, background != nil)
@@ -191,7 +191,7 @@ func TestMainLoopKeyAfterUnsupportedSequence(t *testing.T) {
 
 	// Get the main loop past expecting responses to the background color query
 	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
-	screen.queryTerminalBackground()
+	screen.queryTerminal()
 
 	// A "terminal OK" report, which we never asked for
 	writeTerminal(t, terminal, "\x1b[0n"+"q")
@@ -224,11 +224,11 @@ func TestProcessInputSplitResponses(t *testing.T) {
 	// Split in the middle of the cursor position response
 	incomplete = screen.processInput(incomplete + backgroundResponse[10:] + cursorPositionResponse[:4])
 	assert.Equal(t, incomplete, cursorPositionResponse[:4])
-	assert.Assert(t, !screen.terminalBackgroundDone)
+	assert.Assert(t, !screen.terminalQueriesDone)
 
 	incomplete = screen.processInput(incomplete + cursorPositionResponse[4:] + "q")
 	assert.Equal(t, incomplete, "")
-	assert.Assert(t, screen.terminalBackgroundDone)
+	assert.Assert(t, screen.terminalQueriesDone)
 
 	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x123456))
 	assertEvents(t, screen, EventRune{Rune: 'q'})
@@ -245,7 +245,7 @@ func TestProcessInputSplitST(t *testing.T) {
 
 	incomplete = screen.processInput(incomplete + response[len(response)-1:] + cursorPositionResponse)
 	assert.Equal(t, incomplete, "")
-	assert.Assert(t, screen.terminalBackgroundDone)
+	assert.Assert(t, screen.terminalQueriesDone)
 
 	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x123456))
 	assertEvents(t, screen)
@@ -258,18 +258,18 @@ func TestProcessInputKeyFirst(t *testing.T) {
 
 	incomplete := screen.processInput("q" + backgroundResponse + cursorPositionResponse)
 	assert.Equal(t, incomplete, "")
-	assert.Assert(t, screen.terminalBackgroundDone)
+	assert.Assert(t, screen.terminalQueriesDone)
 
 	assert.Assert(t, screen.terminalBackground != nil)
 	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x123456))
 	assertEvents(t, screen, EventRune{Rune: 'q'})
 }
 
-// Once queryTerminalBackground() has given up waiting, late responses should be
+// Once queryTerminal() has given up waiting, late responses should be
 // ignored
 func TestProcessInputLateBackgroundResponse(t *testing.T) {
 	screen := newInputTestScreen()
-	screen.terminalBackgroundDone = true
+	screen.terminalQueriesDone = true
 
 	incomplete := screen.processInput(backgroundResponse + cursorPositionResponse + "q")
 	assert.Equal(t, incomplete, "")
@@ -282,7 +282,7 @@ func TestProcessInputLateBackgroundResponse(t *testing.T) {
 // the query responses
 func TestProcessInputSplitMouseEvent(t *testing.T) {
 	screen := newInputTestScreen()
-	screen.terminalBackgroundDone = true
+	screen.terminalQueriesDone = true
 
 	incomplete := screen.processInput("\x1b[<64;10;2")
 	assert.Equal(t, incomplete, "\x1b[<64;10;2")
@@ -318,7 +318,7 @@ func TestProcessInputBackgroundResponseInFourPieces(t *testing.T) {
 	incomplete = screen.processInput(incomplete + response[21:24])
 	incomplete = screen.processInput(incomplete + response[24:] + cursorPositionResponse)
 	assert.Equal(t, incomplete, "")
-	assert.Assert(t, screen.terminalBackgroundDone)
+	assert.Assert(t, screen.terminalQueriesDone)
 
 	assert.Assert(t, screen.terminalBackground != nil)
 	assert.Equal(t, *screen.terminalBackground, NewColorHex(0x282828))
@@ -380,9 +380,9 @@ func TestProcessInputAlternateScrollStatus(t *testing.T) {
 
 			incomplete := screen.processInput("\x1b[?1007;" + testCase.status + "$y" + cursorPositionResponse + "q")
 			assert.Equal(t, incomplete, "")
-			assert.Assert(t, screen.terminalBackgroundDone)
+			assert.Assert(t, screen.terminalQueriesDone)
 
-			assert.Equal(t, screen.alternateScroll, testCase.expected)
+			assert.Equal(t, screen.terminalAlternateScroll, testCase.expected)
 			assertEvents(t, screen, EventRune{Rune: 'q'})
 		})
 	}
@@ -394,9 +394,9 @@ func TestProcessInputNoAlternateScrollResponse(t *testing.T) {
 
 	incomplete := screen.processInput(backgroundResponse + cursorPositionResponse)
 	assert.Equal(t, incomplete, "")
-	assert.Assert(t, screen.terminalBackgroundDone)
+	assert.Assert(t, screen.terminalQueriesDone)
 
-	assert.Equal(t, screen.alternateScroll, alternateScrollUnknown)
+	assert.Equal(t, screen.terminalAlternateScroll, alternateScrollUnknown)
 }
 
 // A DECRQM response for some other mode says nothing about Alternate Scroll
@@ -407,7 +407,7 @@ func TestProcessInputOtherModeResponse(t *testing.T) {
 	incomplete := screen.processInput("\x1b[?2004;1$y" + cursorPositionResponse + "q")
 	assert.Equal(t, incomplete, "")
 
-	assert.Equal(t, screen.alternateScroll, alternateScrollUnknown)
+	assert.Equal(t, screen.terminalAlternateScroll, alternateScrollUnknown)
 	assertEvents(t, screen, EventRune{Rune: 'q'})
 }
 
@@ -420,21 +420,21 @@ func TestProcessInputSplitAlternateScrollResponse(t *testing.T) {
 
 	incomplete = screen.processInput(incomplete + alternateScrollOffResponse[6:] + cursorPositionResponse)
 	assert.Equal(t, incomplete, "")
-	assert.Assert(t, screen.terminalBackgroundDone)
+	assert.Assert(t, screen.terminalQueriesDone)
 
-	assert.Equal(t, screen.alternateScroll, alternateScrollSupported)
+	assert.Equal(t, screen.terminalAlternateScroll, alternateScrollSupported)
 	assertEvents(t, screen)
 }
 
-// Once queryTerminalBackground() has given up waiting, late responses should be
+// Once queryTerminal() has given up waiting, late responses should be
 // ignored
 func TestProcessInputLateAlternateScrollResponse(t *testing.T) {
 	screen := newInputTestScreen()
-	screen.terminalBackgroundDone = true
+	screen.terminalQueriesDone = true
 
 	incomplete := screen.processInput(alternateScrollOffResponse + cursorPositionResponse + "q")
 	assert.Equal(t, incomplete, "")
 
-	assert.Equal(t, screen.alternateScroll, alternateScrollUnknown)
+	assert.Equal(t, screen.terminalAlternateScroll, alternateScrollUnknown)
 	assertEvents(t, screen, EventRune{Rune: 'q'})
 }

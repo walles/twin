@@ -162,14 +162,12 @@ type terminalScreen struct {
 	// updates
 	renderLock sync.Mutex
 
+	// Terminal query results and bookkeeping, guarded by terminalQueryLock
 	terminalBackground      *Color
-	terminalBackgroundQuery time.Time // When we asked for the terminal background color
-	terminalBackgroundDone  bool      // Set when done waiting for query responses
-	terminalBackgroundLock  sync.Mutex
-
-	// Whether the terminal supports Alternate Scroll Mode. Guarded by
-	// terminalBackgroundLock.
-	alternateScroll alternateScrollSupport
+	terminalAlternateScroll alternateScrollSupport
+	terminalQueryTime       time.Time // When we sent the terminal queries
+	terminalQueriesDone     bool      // Set when done waiting for query responses
+	terminalQueryLock       sync.Mutex
 
 	cells        [][]StyledRune
 	lastRendered lastRendered // Kept up to date by snapshotLastRendered()
@@ -234,6 +232,18 @@ type eventTerminalBackground struct {
 // response to the cursor position query
 type eventCursorPosition struct{}
 
+// Example response: "\x1b[?1007;2$y", meaning Alternate Scroll Mode is
+// supported but currently off.
+//
+// Ref: https://vt100.net/docs/vt510-rm/DECRPM.html
+var alternateScrollResponseRegex = regexp.MustCompile("^\x1b\\[\\?1007;([0-9]+)\\$y$")
+
+// Internal event, handled by processInput() and never posted: The terminal's
+// response to the Alternate Scroll Mode query
+type eventAlternateScroll struct {
+	status string // As sent by the terminal, like "2"
+}
+
 // Whether the terminal supports Alternate Scroll Mode (1007), which makes the
 // terminal send the mouse wheel as arrow keys while on the alternate screen
 //
@@ -248,6 +258,35 @@ const (
 	alternateScrollSupported
 	alternateScrollUnsupported
 )
+
+// Ref: https://vt100.net/docs/vt510-rm/DECRPM.html
+func alternateScrollSupportFromStatus(status string) alternateScrollSupport {
+	switch status {
+	case "1", "2", "3": // Set, reset, permanently set
+		// Reset means supported but currently off. That's fine, we enable it
+		// when entering the alternate screen.
+		return alternateScrollSupported
+	case "0": // Not recognized
+		return alternateScrollUnsupported
+	case "4": // Permanently reset, can't be enabled
+		return alternateScrollUnsupported
+	default:
+		return alternateScrollUnknown
+	}
+}
+
+func (support alternateScrollSupport) String() string {
+	switch support {
+	case alternateScrollUnknown:
+		return "unknown"
+	case alternateScrollSupported:
+		return "supported"
+	case alternateScrollUnsupported:
+		return "unsupported"
+	default:
+		return fmt.Sprint("alternateScrollSupport(", int(support), ")")
+	}
+}
 
 // NewScreen creates a new Screen according to options. Passing the zero value
 // Options{} auto-detects mouse mode and terminal color count, and disables
@@ -305,8 +344,8 @@ func NewScreen(options Options) (Screen, error) {
 		screen.mainLoop()
 	}()
 
-	// The response will be handled in screen.mainLoop() that we just started ^.
-	screen.queryTerminalBackground()
+	// The responses will be handled in screen.mainLoop() that we just started ^.
+	screen.queryTerminal()
 
 	// NOTE: We deliberately do *not* enter the alternate screen here. That
 	// happens on the first Show(), so that a moor run that never paints
@@ -315,64 +354,70 @@ func NewScreen(options Options) (Screen, error) {
 	return &screen, nil
 }
 
-// Request terminal background color, and wait for the response (or give up on
-// it). mainLoop() must be running, it's what handles the response.
-//
-// Ref:
-// https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
-func (screen *terminalScreen) queryTerminalBackground() {
+// Ask the terminal for its background color and whether it supports Alternate
+// Scroll Mode, and wait for the responses (or give up on them). mainLoop()
+// must be running, it's what handles the responses.
+func (screen *terminalScreen) queryTerminal() {
 	// Note the query timestamp before asking, so that mainLoop() can never
 	// observe a response that arrived before we recorded asking for it.
 	start := time.Now()
-	screen.terminalBackgroundLock.Lock()
-	screen.terminalBackgroundQuery = start
-	screen.terminalBackgroundLock.Unlock()
+	screen.terminalQueryLock.Lock()
+	screen.terminalQueryTime = start
+	screen.terminalQueryLock.Unlock()
+
+	// Ref: https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
+	const backgroundColorQuery = "\x1b]11;?\x07"
+
+	// DECRQM query. This only asks, we enable the mode when entering the
+	// alternate screen.
+	//
+	// Ref: https://vt100.net/docs/vt510-rm/DECRQM.html
+	const alternateScrollQuery = "\x1b[?1007$p"
 
 	// Terminals answer queries in order, and practically all terminals answer
-	// the cursor position query. So we ask for the cursor position as an
+	// the cursor position query. So we ask for the cursor position last, as an
 	// "end-of-message" marker.
 	//
 	// Ref: https://github.com/walles/moor/issues/53#issuecomment-3392572761
-	screen.renderLock.Lock()
-	const backgroundColorQuery = "\x1b]11;?\x07"
 	const cursorPositionQuery = "\x1b[6n"
-	screen.writeLocked(backgroundColorQuery + cursorPositionQuery)
+
+	screen.renderLock.Lock()
+	screen.writeLocked(backgroundColorQuery + alternateScrollQuery + cursorPositionQuery)
 	screen.renderLock.Unlock()
 
-	// Wait for the background color response (or give up on it) before
-	// returning. Callers want the color for styling their first frame, and
-	// waiting for it here means the wait happens while the user's terminal is
-	// still untouched.
+	// Normally the wait ends as soon as the cursor position query is answered,
+	// with or without other responses before it. This timeout is a backstop
+	// for terminals that answer no queries at all, which we don't expect to
+	// happen. Make it long enough to accommodate slow links.
+	const maxWait = 500 * time.Millisecond
+
+	// Wait for the responses (or give up on them) before returning. Callers
+	// want the color for styling their first frame, and waiting for it here
+	// means the wait happens while the user's terminal is still untouched.
 	//
 	// Waiting here also means the responses have been consumed before anybody
 	// can Close() the screen. Otherwise they could be printed as text in the
 	// user's terminal after exit.
 	//
 	// Refs:
-	// * https://github.com/walles/moor/issues/425
 	// * https://github.com/walles/moor/issues/380
-	//
-	// Normally the wait ends as soon as the cursor position query is answered,
-	// with or without a background color response before it. This timeout is
-	// a backstop for terminals that answer neither query, which we don't
-	// expect to happen. Make it long enough to accommodate slow links.
-	const maxWait = 500 * time.Millisecond
+	// * https://github.com/walles/moor/issues/425
 	for {
-		screen.terminalBackgroundLock.Lock()
-		if screen.terminalBackgroundDone {
-			screen.terminalBackgroundLock.Unlock()
+		screen.terminalQueryLock.Lock()
+		if screen.terminalQueriesDone {
+			screen.terminalQueryLock.Unlock()
 			return
 		}
 
 		if time.Since(start) > maxWait {
 			log.Info(fmt.Sprint("No terminal query responses after ", maxWait, ", giving up"))
-			screen.terminalBackgroundDone = true
-			screen.terminalBackgroundLock.Unlock()
+			screen.terminalQueriesDone = true
+			screen.terminalQueryLock.Unlock()
 			return
 		}
 
 		// Unlock so mainLoop() can handle the responses
-		screen.terminalBackgroundLock.Unlock()
+		screen.terminalQueryLock.Unlock()
 
 		// It's not more urgent than this
 		time.Sleep(5 * time.Millisecond)
@@ -725,24 +770,37 @@ func (screen *terminalScreen) processInput(input string) (incomplete string) {
 		}
 
 		if background, ok := (*event).(eventTerminalBackground); ok {
-			screen.terminalBackgroundLock.Lock()
-			if screen.terminalBackgroundDone {
+			screen.terminalQueryLock.Lock()
+			if screen.terminalQueriesDone {
 				log.Info(fmt.Sprint("Got the terminal background color ", background.color, " after we stopped waiting for it, ignoring"))
 			} else {
 				screen.terminalBackground = &background.color
-				log.Debug(fmt.Sprint("Terminal background color detected as ", background.color, " after ", time.Since(screen.terminalBackgroundQuery)))
+				log.Debug(fmt.Sprint("Terminal background color detected as ", background.color, " after ", time.Since(screen.terminalQueryTime)))
 			}
-			screen.terminalBackgroundLock.Unlock()
+			screen.terminalQueryLock.Unlock()
+			continue
+		}
+
+		if alternateScroll, ok := (*event).(eventAlternateScroll); ok {
+			support := alternateScrollSupportFromStatus(alternateScroll.status)
+			screen.terminalQueryLock.Lock()
+			if screen.terminalQueriesDone {
+				log.Info(fmt.Sprint("Got Alternate Scroll Mode status ", alternateScroll.status, " (", support, ") after we stopped waiting for it, ignoring"))
+			} else {
+				screen.terminalAlternateScroll = support
+				log.Debug(fmt.Sprint("Alternate Scroll Mode status ", alternateScroll.status, " (", support, ") after ", time.Since(screen.terminalQueryTime)))
+			}
+			screen.terminalQueryLock.Unlock()
 			continue
 		}
 
 		if _, ok := (*event).(eventCursorPosition); ok {
-			screen.terminalBackgroundLock.Lock()
-			if !screen.terminalBackgroundDone {
-				log.Debug(fmt.Sprint("Got the cursor position response after ", time.Since(screen.terminalBackgroundQuery), ", done waiting for terminal query responses"))
-				screen.terminalBackgroundDone = true
+			screen.terminalQueryLock.Lock()
+			if !screen.terminalQueriesDone {
+				log.Debug(fmt.Sprint("Got the cursor position response after ", time.Since(screen.terminalQueryTime), ", done waiting for terminal query responses"))
+				screen.terminalQueriesDone = true
 			}
-			screen.terminalBackgroundLock.Unlock()
+			screen.terminalQueryLock.Unlock()
 			continue
 		}
 
@@ -880,6 +938,11 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string, bool) {
 
 		if background := parseTerminalBgColorResponse(sequence); background != nil {
 			var event Event = eventTerminalBackground{color: *background}
+			return &event, encodedEventSequences[byteLength:], false
+		}
+
+		if match := alternateScrollResponseRegex.FindStringSubmatch(sequence); match != nil {
+			var event Event = eventAlternateScroll{status: match[1]}
 			return &event, encodedEventSequences[byteLength:], false
 		}
 
@@ -1050,8 +1113,8 @@ func (screen *terminalScreen) applyPendingResize() {
 // NewScreen() waits for background color to be populated. So this method only
 // has to take the lock and return the value.
 func (screen *terminalScreen) TerminalBackground() *Color {
-	screen.terminalBackgroundLock.Lock()
-	defer screen.terminalBackgroundLock.Unlock()
+	screen.terminalQueryLock.Lock()
+	defer screen.terminalQueryLock.Unlock()
 	return screen.terminalBackground
 }
 
