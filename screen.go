@@ -651,12 +651,6 @@ func terminalHasArrowKeysEmulation() bool {
 		return true
 	}
 
-	// Terminator, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("TERMINATOR_UUID") != "" {
-		log.Info("Terminator terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
 	// Foot, tested on Ubuntu 22.04, December 16th 2023
 	if os.Getenv("TERM") == "foot" || strings.HasPrefix(os.Getenv("TERM"), "foot-") {
 		// Note that this test isn't very good, somebody could be running Foot
