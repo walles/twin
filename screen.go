@@ -636,12 +636,6 @@ func terminalHasArrowKeysEmulation() bool {
 		return true
 	}
 
-	// Tilix, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("TILIX_ID") != "" {
-		log.Info("Tilix terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
 	// Konsole, tested on Ubuntu 22.04, December 16th 2023
 	if os.Getenv("KONSOLE_VERSION") != "" {
 		log.Info("Konsole terminal detected, assuming arrow keys emulation active")
