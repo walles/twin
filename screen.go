@@ -609,19 +609,22 @@ func terminalHasArrowKeysEmulation() bool {
 	// * Contour, thanks to @postsolar (GitHub username) for testing, 2023-12-18
 	// * Foot, thanks to @postsolar (GitHub username) for testing, 2023-12-19
 
-	// Hyper 3.4.1, does not support alt scroll mode, so we need to special case it
+	// Hyper 3.4.1, does not support alt scroll mode, so we need to special case
+	// it
 	if os.Getenv("TERM_PROGRAM") == "Hyper" {
 		log.Info("Hyper terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Kitty 0.48.2, does not support alt scroll mode, so we need to special case it
+	// Kitty 0.48.2, does not support alt scroll mode, so we need to special
+	// case it
 	if os.Getenv("KITTY_WINDOW_ID") != "" {
 		log.Info("Kitty terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Warp, tested on macOS, December 14th 2023
+	// Warp v0.2026.09.30.08.29.stable_01, does not support alt scroll mode, so
+	// we need to special case it
 	if os.Getenv("TERM_PROGRAM") == "WarpTerminal" {
 		log.Info("Warp terminal detected, assuming arrow keys emulation active")
 		return true
@@ -653,7 +656,8 @@ func terminalHasArrowKeysEmulation() bool {
 		return true
 	}
 
-	// Wezterm, tested on MacOS 12.6, January 3rd, 2024
+	// Wezterm 20240203-110809-5046fc22, does not support alt scroll mode, so we
+	// need to special case it
 	if os.Getenv("TERM_PROGRAM") == "WezTerm" {
 		log.Info("Wezterm terminal detected, assuming arrow keys emulation active")
 		return true
@@ -681,12 +685,6 @@ func terminalHasArrowKeysEmulation() bool {
 	// https://github.com/walles/moor/issues/53#issuecomment-3276404279
 	if os.Getenv("WT_SESSION") != "" {
 		log.Info("Windows Terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// iTerm2, supports alternateScroll mode, and therefore works with "select"
-	if os.Getenv("TERM_PROGRAM") == "iTerm.app" {
-		log.Info("iTerm2 terminal detected, gets arrow keys emulation through alternateScroll mode")
 		return true
 	}
 
