@@ -606,7 +606,6 @@ func (screen *terminalScreen) onWindowResized() {
 func terminalHasArrowKeysEmulation() bool {
 	// Better off with mouse tracking:
 	// * Terminal.app (macOS)
-	// * Contour, thanks to @postsolar (GitHub username) for testing, 2023-12-18
 
 	// Hyper 3.4.1, does not support alt scroll mode, so we need to special case
 	// it
