@@ -84,7 +84,7 @@ func TestTerminalBackgroundQueries(t *testing.T) {
 	screen, terminal, output := newPipeTestScreen(t)
 	writeTerminal(t, terminal, cursorPositionResponse)
 
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 
 	assert.Assert(t, strings.Contains(output(), "\x1b]11;?\x07\x1b[?1007$p\x1b[6n"), humanizeLowASCII(output()))
 	assert.Assert(t, !strings.Contains(output(), "\x1b[?1007h"), humanizeLowASCII(output()))
@@ -105,7 +105,7 @@ func TestTerminalBackgroundSlowResponse(t *testing.T) {
 	t.Cleanup(func() { <-written })
 
 	start := time.Now()
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 
 	// Well below the 500ms backstop, so we know it was the cursor position
 	// response that ended the wait
@@ -125,7 +125,7 @@ func TestTerminalBackgroundResponsesThenKey(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
 
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 
 	background := screen.TerminalBackground()
 	assert.Assert(t, background != nil)
@@ -143,7 +143,7 @@ func TestTerminalBackgroundNoBackgroundResponse(t *testing.T) {
 	writeTerminal(t, terminal, cursorPositionResponse)
 
 	start := time.Now()
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 	assert.Assert(t, time.Since(start) < 50*time.Millisecond, "Waited for %s", time.Since(start))
 
 	assert.Assert(t, screen.TerminalBackground() == nil)
@@ -158,11 +158,11 @@ func TestTerminalBackgroundAlternateScrollResponse(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, backgroundResponse+alternateScrollOffResponse+cursorPositionResponse)
 
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 
-	screen.terminalQueryLock.Lock()
+	screen.terminalPropertiesLock.Lock()
 	alternateScroll := screen.terminalAlternateScroll
-	screen.terminalQueryLock.Unlock()
+	screen.terminalPropertiesLock.Unlock()
 	assert.Equal(t, alternateScroll, alternateScrollSupported)
 
 	writeTerminal(t, terminal, "q")
@@ -175,7 +175,7 @@ func TestTerminalBackgroundKeyFirst(t *testing.T) {
 	screen, terminal, _ := newPipeTestScreen(t)
 	writeTerminal(t, terminal, "q"+backgroundResponse+cursorPositionResponse)
 
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 
 	background := screen.TerminalBackground()
 	assert.Assert(t, background != nil)
@@ -191,7 +191,7 @@ func TestMainLoopKeyAfterUnsupportedSequence(t *testing.T) {
 
 	// Get the main loop past expecting responses to the background color query
 	writeTerminal(t, terminal, backgroundResponse+cursorPositionResponse)
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
 
 	// A "terminal OK" report, which we never asked for
 	writeTerminal(t, terminal, "\x1b[0n"+"q")
@@ -265,8 +265,8 @@ func TestProcessInputKeyFirst(t *testing.T) {
 	assertEvents(t, screen, EventRune{Rune: 'q'})
 }
 
-// Once queryTerminal() has given up waiting, late responses should be
-// ignored
+// Once detectTerminalProperties() has given up waiting, late responses should
+// be ignored
 func TestProcessInputLateBackgroundResponse(t *testing.T) {
 	screen := newInputTestScreen()
 	screen.terminalQueriesDone = true
@@ -426,8 +426,8 @@ func TestProcessInputSplitAlternateScrollResponse(t *testing.T) {
 	assertEvents(t, screen)
 }
 
-// Once queryTerminal() has given up waiting, late responses should be
-// ignored
+// Once detectTerminalProperties() has given up waiting, late responses should
+// be ignored
 func TestProcessInputLateAlternateScrollResponse(t *testing.T) {
 	screen := newInputTestScreen()
 	screen.terminalQueriesDone = true

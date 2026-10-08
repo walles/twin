@@ -162,12 +162,12 @@ type terminalScreen struct {
 	// updates
 	renderLock sync.Mutex
 
-	// Terminal query results and bookkeeping, guarded by terminalQueryLock
+	// Terminal properties and query bookkeeping, guarded by terminalPropertiesLock
 	terminalBackground      *Color
 	terminalAlternateScroll alternateScrollSupport
 	terminalQueryTime       time.Time // When we sent the terminal queries
 	terminalQueriesDone     bool      // Set when done waiting for query responses
-	terminalQueryLock       sync.Mutex
+	terminalPropertiesLock  sync.Mutex
 
 	cells        [][]StyledRune
 	lastRendered lastRendered // Kept up to date by snapshotLastRendered()
@@ -206,7 +206,11 @@ type terminalScreen struct {
 	oldTtyOutMode uint32 //nolint Windows only
 
 	terminalColorCount ColorCount
-	mouseMode          MouseMode
+
+	// Whether to explicitly enable mouse tracking on the alternate screen and
+	// get mouse scroll events. Decided once, in NewScreen(). Downside is that
+	// this inhibits selecting text with the mouse.
+	mouseTracking bool
 }
 
 // Example event: "\x1b[<65;127;41M"
@@ -316,7 +320,6 @@ func NewScreen(options Options) (Screen, error) {
 
 	screen := terminalScreen{
 		terminalColorCount: terminalColorCount,
-		mouseMode:          options.MouseMode,
 		getSize:            term.GetSize,
 
 		// Sized from manual testing on my MacBook: start
@@ -345,7 +348,12 @@ func NewScreen(options Options) (Screen, error) {
 	}()
 
 	// The responses will be handled in screen.mainLoop() that we just started ^.
-	screen.queryTerminal()
+	screen.detectTerminalProperties()
+
+	screen.terminalPropertiesLock.Lock()
+	alternateScroll := screen.terminalAlternateScroll
+	screen.terminalPropertiesLock.Unlock()
+	screen.mouseTracking = shouldEnableMouseTracking(options.MouseMode, alternateScroll, terminalHasArrowKeysEmulation)
 
 	// NOTE: We deliberately do *not* enter the alternate screen here. That
 	// happens on the first Show(), so that a moor run that never paints
@@ -357,13 +365,13 @@ func NewScreen(options Options) (Screen, error) {
 // Ask the terminal for its background color and whether it supports Alternate
 // Scroll Mode, and wait for the responses (or give up on them). mainLoop()
 // must be running, it's what handles the responses.
-func (screen *terminalScreen) queryTerminal() {
+func (screen *terminalScreen) detectTerminalProperties() {
 	// Note the query timestamp before asking, so that mainLoop() can never
 	// observe a response that arrived before we recorded asking for it.
 	start := time.Now()
-	screen.terminalQueryLock.Lock()
+	screen.terminalPropertiesLock.Lock()
 	screen.terminalQueryTime = start
-	screen.terminalQueryLock.Unlock()
+	screen.terminalPropertiesLock.Unlock()
 
 	// Ref: https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
 	const backgroundColorQuery = "\x1b]11;?\x07"
@@ -395,6 +403,9 @@ func (screen *terminalScreen) queryTerminal() {
 	// want the color for styling their first frame, and waiting for it here
 	// means the wait happens while the user's terminal is still untouched.
 	//
+	// NewScreen() also needs the Alternate Scroll Mode support to decide
+	// whether to enable mouse tracking.
+	//
 	// Waiting here also means the responses have been consumed before anybody
 	// can Close() the screen. Otherwise they could be printed as text in the
 	// user's terminal after exit.
@@ -403,21 +414,21 @@ func (screen *terminalScreen) queryTerminal() {
 	// * https://github.com/walles/moor/issues/380
 	// * https://github.com/walles/moor/issues/425
 	for {
-		screen.terminalQueryLock.Lock()
+		screen.terminalPropertiesLock.Lock()
 		if screen.terminalQueriesDone {
-			screen.terminalQueryLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
 			return
 		}
 
 		if time.Since(start) > maxWait {
 			log.Info(fmt.Sprint("No terminal query responses after ", maxWait, ", giving up"))
 			screen.terminalQueriesDone = true
-			screen.terminalQueryLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
 			return
 		}
 
 		// Unlock so mainLoop() can handle the responses
-		screen.terminalQueryLock.Unlock()
+		screen.terminalPropertiesLock.Unlock()
 
 		// It's not more urgent than this
 		time.Sleep(5 * time.Millisecond)
@@ -513,7 +524,7 @@ func (screen *terminalScreen) enterAlternateScreenSessionLocked() {
 	}
 
 	screen.setAlternateScreenModeLocked(true)
-	screen.enableMouseTrackingLocked(screen.shouldEnableMouseTracking())
+	screen.enableMouseTrackingLocked(screen.mouseTracking)
 
 	screen.alternateScreenActive = true
 
@@ -540,16 +551,24 @@ func (screen *terminalScreen) leaveAlternateScreenSessionLocked() {
 	screen.alternateScreenActive = false
 }
 
-func (screen *terminalScreen) shouldEnableMouseTracking() bool {
-	switch screen.mouseMode {
+// Pass terminalHasArrowKeysEmulation() as hasArrowKeysEmulation. It's a
+// parameter so that tests can control it.
+func shouldEnableMouseTracking(mouseMode MouseMode, alternateScroll alternateScrollSupport, hasArrowKeysEmulation func() bool) bool {
+	switch mouseMode {
 	case MouseModeAuto:
-		return !terminalHasArrowKeysEmulation()
+		if alternateScroll == alternateScrollSupported {
+			log.Info("Terminal supports Alternate Scroll Mode, so the mouse wheel will arrive as arrow keys, not enabling mouse tracking")
+			return false
+		}
+
+		log.Info(fmt.Sprint("Terminal Alternate Scroll Mode support is ", alternateScroll, ", checking terminal specifics"))
+		return !hasArrowKeysEmulation()
 	case MouseModeSelect:
 		return false
 	case MouseModeScroll:
 		return true
 	default:
-		panic(fmt.Errorf("unknown mouse mode: %d", screen.mouseMode))
+		panic(fmt.Errorf("unknown mouse mode: %d", mouseMode))
 	}
 }
 
@@ -770,37 +789,37 @@ func (screen *terminalScreen) processInput(input string) (incomplete string) {
 		}
 
 		if background, ok := (*event).(eventTerminalBackground); ok {
-			screen.terminalQueryLock.Lock()
+			screen.terminalPropertiesLock.Lock()
 			if screen.terminalQueriesDone {
 				log.Info(fmt.Sprint("Got the terminal background color ", background.color, " after we stopped waiting for it, ignoring"))
 			} else {
 				screen.terminalBackground = &background.color
 				log.Debug(fmt.Sprint("Terminal background color detected as ", background.color, " after ", time.Since(screen.terminalQueryTime)))
 			}
-			screen.terminalQueryLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
 			continue
 		}
 
 		if alternateScroll, ok := (*event).(eventAlternateScroll); ok {
 			support := alternateScrollSupportFromStatus(alternateScroll.status)
-			screen.terminalQueryLock.Lock()
+			screen.terminalPropertiesLock.Lock()
 			if screen.terminalQueriesDone {
 				log.Info(fmt.Sprint("Got Alternate Scroll Mode status ", alternateScroll.status, " (", support, ") after we stopped waiting for it, ignoring"))
 			} else {
 				screen.terminalAlternateScroll = support
 				log.Debug(fmt.Sprint("Alternate Scroll Mode status ", alternateScroll.status, " (", support, ") after ", time.Since(screen.terminalQueryTime)))
 			}
-			screen.terminalQueryLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
 			continue
 		}
 
 		if _, ok := (*event).(eventCursorPosition); ok {
-			screen.terminalQueryLock.Lock()
+			screen.terminalPropertiesLock.Lock()
 			if !screen.terminalQueriesDone {
 				log.Debug(fmt.Sprint("Got the cursor position response after ", time.Since(screen.terminalQueryTime), ", done waiting for terminal query responses"))
 				screen.terminalQueriesDone = true
 			}
-			screen.terminalQueryLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
 			continue
 		}
 
@@ -1113,8 +1132,8 @@ func (screen *terminalScreen) applyPendingResize() {
 // NewScreen() waits for background color to be populated. So this method only
 // has to take the lock and return the value.
 func (screen *terminalScreen) TerminalBackground() *Color {
-	screen.terminalQueryLock.Lock()
-	defer screen.terminalQueryLock.Unlock()
+	screen.terminalPropertiesLock.Lock()
+	defer screen.terminalPropertiesLock.Unlock()
 	return screen.terminalBackground
 }
 
