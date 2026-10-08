@@ -609,21 +609,15 @@ func terminalHasArrowKeysEmulation() bool {
 	// * Contour, thanks to @postsolar (GitHub username) for testing, 2023-12-18
 	// * Foot, thanks to @postsolar (GitHub username) for testing, 2023-12-19
 
-	// Hyper, tested on macOS, December 14th 2023
+	// Hyper 3.4.1, does not support alt scroll mode, so we need to special case it
 	if os.Getenv("TERM_PROGRAM") == "Hyper" {
 		log.Info("Hyper terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Kitty, tested on macOS, December 14th 2023
+	// Kitty 0.48.2, does not support alt scroll mode, so we need to special case it
 	if os.Getenv("KITTY_WINDOW_ID") != "" {
 		log.Info("Kitty terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Alacritty, tested on macOS, December 14th 2023
-	if os.Getenv("ALACRITTY_WINDOW_ID") != "" {
-		log.Info("Alacritty terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
