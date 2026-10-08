@@ -15,6 +15,13 @@ import (
 	"golang.org/x/term"
 )
 
+// Sized on PTYXIS 50.1 under GNOME on a macBook. Touch pad scrolling seems too
+// fast in this version of PTYXIS, but that's unrelated to twin.
+//
+// I did moor --debug /etc/services and two-finger touch scrolled up and down.
+// 320 was too little in that setup.
+const eventBufferSize = 640
+
 // MouseMode controls how mouse events are captured. See MouseModeAuto,
 // MouseModeSelect and MouseModeScroll for the available behaviors.
 type MouseMode int
@@ -322,14 +329,7 @@ func NewScreen(options Options) (Screen, error) {
 		terminalColorCount: terminalColorCount,
 		getSize:            term.GetSize,
 
-		// Sized from manual testing on my MacBook: start
-		// "./moor.sh sample-files/large-git-log-patch.txt", then do a two
-		// finger flick initiating a momentum based scroll-up. If you get
-		// "Events buffer full" warnings, the buffer is too small.
-		//
-		// Doubled from the smallest size that held up in that test, for
-		// headroom: https://github.com/walles/moor/issues/164
-		events: make(chan Event, 160),
+		events: make(chan Event, eventBufferSize),
 	}
 
 	screen.setupSigwinchNotification()
@@ -839,8 +839,7 @@ func (screen *terminalScreen) processInput(input string) (incomplete string) {
 		case screen.events <- *event:
 			// Yay
 		default:
-			// If this happens, consider increasing the channel size in
-			// NewScreen()
+			// If this happens, consider doubling the eventBufferSize constant
 			log.Info(fmt.Sprintf("Events buffer (size %d) full, events are being dropped", cap(screen.events)))
 		}
 	}
