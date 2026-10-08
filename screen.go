@@ -607,7 +607,6 @@ func terminalHasArrowKeysEmulation() bool {
 	// Better off with mouse tracking:
 	// * Terminal.app (macOS)
 	// * Contour, thanks to @postsolar (GitHub username) for testing, 2023-12-18
-	// * Foot, thanks to @postsolar (GitHub username) for testing, 2023-12-19
 
 	// Hyper 3.4.1, does not support alt scroll mode, so we need to special case
 	// it
@@ -636,17 +635,10 @@ func terminalHasArrowKeysEmulation() bool {
 		return true
 	}
 
-	// Konsole, tested on Ubuntu 22.04, December 16th 2023
+	// Konsole 25.12.3, does not support alt scroll mode, so we need to special
+	// case it
 	if os.Getenv("KONSOLE_VERSION") != "" {
 		log.Info("Konsole terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Foot, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("TERM") == "foot" || strings.HasPrefix(os.Getenv("TERM"), "foot-") {
-		// Note that this test isn't very good, somebody could be running Foot
-		// with some other TERM setting. Other suggestions welcome.
-		log.Info("Foot terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
