@@ -628,12 +628,6 @@ func terminalHasArrowKeysEmulation() bool {
 		return true
 	}
 
-	// GNOME Terminal, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("GNOME_TERMINAL_SCREEN") != "" {
-		log.Info("GNOME Terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
 	// Konsole 25.12.3, does not support alt scroll mode, so we need to special
 	// case it
 	if os.Getenv("KONSOLE_VERSION") != "" {
