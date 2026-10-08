@@ -671,7 +671,7 @@ func terminalHasArrowKeysEmulation() bool {
 		return true
 	}
 
-	// VSCode 1.89.0, tested on macOS 14.4, May 6th, 2024
+	// VSCode 1.140.0 does not support alt scroll mode, so we need to special case it
 	if os.Getenv("TERM_PROGRAM") == "vscode" {
 		log.Info("VSCode terminal detected, assuming arrow keys emulation active")
 		return true
