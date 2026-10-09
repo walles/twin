@@ -15,6 +15,13 @@ import (
 	"golang.org/x/term"
 )
 
+// Sized on PTYXIS 50.1 under GNOME on a macBook. Touch pad scrolling seems too
+// fast in this version of PTYXIS, but that's unrelated to twin.
+//
+// I did moor --debug /etc/services and two-finger touch scrolled up and down.
+// 320 was too little in that setup.
+const eventBufferSize = 640
+
 // MouseMode controls how mouse events are captured. See MouseModeAuto,
 // MouseModeSelect and MouseModeScroll for the available behaviors.
 type MouseMode int
@@ -162,10 +169,12 @@ type terminalScreen struct {
 	// updates
 	renderLock sync.Mutex
 
+	// Terminal properties and query bookkeeping, guarded by terminalPropertiesLock
 	terminalBackground      *Color
-	terminalBackgroundQuery time.Time // When we asked for the terminal background color
-	terminalBackgroundDone  bool      // Set when done waiting for query responses
-	terminalBackgroundLock  sync.Mutex
+	terminalAlternateScroll alternateScrollSupport
+	terminalQueryTime       time.Time // When we sent the terminal queries
+	terminalQueriesDone     bool      // Set when done waiting for query responses
+	terminalPropertiesLock  sync.Mutex
 
 	cells        [][]StyledRune
 	lastRendered lastRendered // Kept up to date by snapshotLastRendered()
@@ -204,7 +213,11 @@ type terminalScreen struct {
 	oldTtyOutMode uint32 //nolint Windows only
 
 	terminalColorCount ColorCount
-	mouseMode          MouseMode
+
+	// Whether to explicitly enable mouse tracking on the alternate screen and
+	// get mouse scroll events. Decided once, in NewScreen(). Downside is that
+	// this inhibits selecting text with the mouse.
+	mouseTracking bool
 }
 
 // Example event: "\x1b[<65;127;41M"
@@ -229,6 +242,62 @@ type eventTerminalBackground struct {
 // Internal event, handled by processInput() and never posted: The terminal's
 // response to the cursor position query
 type eventCursorPosition struct{}
+
+// Example response: "\x1b[?1007;2$y", meaning Alternate Scroll Mode is
+// supported but currently off.
+//
+// Ref: https://vt100.net/docs/vt510-rm/DECRPM.html
+var alternateScrollResponseRegex = regexp.MustCompile("^\x1b\\[\\?1007;([0-9]+)\\$y$")
+
+// Internal event, handled by processInput() and never posted: The terminal's
+// response to the Alternate Scroll Mode query
+type eventAlternateScroll struct {
+	status string // As sent by the terminal, like "2"
+}
+
+// Whether the terminal supports Alternate Scroll Mode (1007), which makes the
+// terminal send the mouse wheel as arrow keys while on the alternate screen
+//
+// Ref: https://github.com/walles/moor/issues/53#issuecomment-3392572761
+type alternateScrollSupport int
+
+const (
+	// We don't know: no response before the cursor position response, or a
+	// status we don't understand
+	alternateScrollUnknown alternateScrollSupport = iota
+
+	alternateScrollSupported
+	alternateScrollUnsupported
+)
+
+// Ref: https://vt100.net/docs/vt510-rm/DECRPM.html
+func alternateScrollSupportFromStatus(status string) alternateScrollSupport {
+	switch status {
+	case "1", "2", "3": // Set, reset, permanently set
+		// Reset means supported but currently off. That's fine, we enable it
+		// when entering the alternate screen.
+		return alternateScrollSupported
+	case "0": // Not recognized
+		return alternateScrollUnsupported
+	case "4": // Permanently reset, can't be enabled
+		return alternateScrollUnsupported
+	default:
+		return alternateScrollUnknown
+	}
+}
+
+func (support alternateScrollSupport) String() string {
+	switch support {
+	case alternateScrollUnknown:
+		return "unknown"
+	case alternateScrollSupported:
+		return "supported"
+	case alternateScrollUnsupported:
+		return "unsupported"
+	default:
+		return fmt.Sprint("alternateScrollSupport(", int(support), ")")
+	}
+}
 
 // NewScreen creates a new Screen according to options. Passing the zero value
 // Options{} auto-detects mouse mode and terminal color count, and disables
@@ -258,17 +327,9 @@ func NewScreen(options Options) (Screen, error) {
 
 	screen := terminalScreen{
 		terminalColorCount: terminalColorCount,
-		mouseMode:          options.MouseMode,
 		getSize:            term.GetSize,
 
-		// Sized from manual testing on my MacBook: start
-		// "./moor.sh sample-files/large-git-log-patch.txt", then do a two
-		// finger flick initiating a momentum based scroll-up. If you get
-		// "Events buffer full" warnings, the buffer is too small.
-		//
-		// Doubled from the smallest size that held up in that test, for
-		// headroom: https://github.com/walles/moor/issues/164
-		events: make(chan Event, 160),
+		events: make(chan Event, eventBufferSize),
 	}
 
 	screen.setupSigwinchNotification()
@@ -286,8 +347,13 @@ func NewScreen(options Options) (Screen, error) {
 		screen.mainLoop()
 	}()
 
-	// The response will be handled in screen.mainLoop() that we just started ^.
-	screen.queryTerminalBackground()
+	// The responses will be handled in screen.mainLoop() that we just started ^.
+	screen.detectTerminalProperties()
+
+	screen.terminalPropertiesLock.Lock()
+	alternateScroll := screen.terminalAlternateScroll
+	screen.terminalPropertiesLock.Unlock()
+	screen.mouseTracking = shouldEnableMouseTracking(options.MouseMode, alternateScroll, terminalHasArrowKeysEmulation)
 
 	// NOTE: We deliberately do *not* enter the alternate screen here. That
 	// happens on the first Show(), so that a moor run that never paints
@@ -296,64 +362,73 @@ func NewScreen(options Options) (Screen, error) {
 	return &screen, nil
 }
 
-// Request terminal background color, and wait for the response (or give up on
-// it). mainLoop() must be running, it's what handles the response.
-//
-// Ref:
-// https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
-func (screen *terminalScreen) queryTerminalBackground() {
+// Ask the terminal for its background color and whether it supports Alternate
+// Scroll Mode, and wait for the responses (or give up on them). mainLoop()
+// must be running, it's what handles the responses.
+func (screen *terminalScreen) detectTerminalProperties() {
 	// Note the query timestamp before asking, so that mainLoop() can never
 	// observe a response that arrived before we recorded asking for it.
 	start := time.Now()
-	screen.terminalBackgroundLock.Lock()
-	screen.terminalBackgroundQuery = start
-	screen.terminalBackgroundLock.Unlock()
+	screen.terminalPropertiesLock.Lock()
+	screen.terminalQueryTime = start
+	screen.terminalPropertiesLock.Unlock()
+
+	// Ref: https://stackoverflow.com/questions/2507337/how-to-determine-a-terminals-background-color
+	const backgroundColorQuery = "\x1b]11;?\x07"
+
+	// DECRQM query. This only asks, we enable the mode when entering the
+	// alternate screen.
+	//
+	// Ref: https://vt100.net/docs/vt510-rm/DECRQM.html
+	const alternateScrollQuery = "\x1b[?1007$p"
 
 	// Terminals answer queries in order, and practically all terminals answer
-	// the cursor position query. So we ask for the cursor position as an
+	// the cursor position query. So we ask for the cursor position last, as an
 	// "end-of-message" marker.
 	//
 	// Ref: https://github.com/walles/moor/issues/53#issuecomment-3392572761
-	screen.renderLock.Lock()
-	const backgroundColorQuery = "\x1b]11;?\x07"
 	const cursorPositionQuery = "\x1b[6n"
-	screen.writeLocked(backgroundColorQuery + cursorPositionQuery)
+
+	screen.renderLock.Lock()
+	screen.writeLocked(backgroundColorQuery + alternateScrollQuery + cursorPositionQuery)
 	screen.renderLock.Unlock()
 
-	// Wait for the background color response (or give up on it) before
-	// returning. Callers want the color for styling their first frame, and
-	// waiting for it here means the wait happens while the user's terminal is
-	// still untouched.
+	// Normally the wait ends as soon as the cursor position query is answered,
+	// with or without other responses before it. This timeout is a backstop
+	// for terminals that answer no queries at all, which we don't expect to
+	// happen. Make it long enough to accommodate slow links.
+	const maxWait = 500 * time.Millisecond
+
+	// Wait for the responses (or give up on them) before returning. Callers
+	// want the color for styling their first frame, and waiting for it here
+	// means the wait happens while the user's terminal is still untouched.
+	//
+	// NewScreen() also needs the Alternate Scroll Mode support to decide
+	// whether to enable mouse tracking.
 	//
 	// Waiting here also means the responses have been consumed before anybody
 	// can Close() the screen. Otherwise they could be printed as text in the
 	// user's terminal after exit.
 	//
 	// Refs:
-	// * https://github.com/walles/moor/issues/425
 	// * https://github.com/walles/moor/issues/380
-	//
-	// Normally the wait ends as soon as the cursor position query is answered,
-	// with or without a background color response before it. This timeout is
-	// a backstop for terminals that answer neither query, which we don't
-	// expect to happen. Make it long enough to accommodate slow links.
-	const maxWait = 500 * time.Millisecond
+	// * https://github.com/walles/moor/issues/425
 	for {
-		screen.terminalBackgroundLock.Lock()
-		if screen.terminalBackgroundDone {
-			screen.terminalBackgroundLock.Unlock()
+		screen.terminalPropertiesLock.Lock()
+		if screen.terminalQueriesDone {
+			screen.terminalPropertiesLock.Unlock()
 			return
 		}
 
 		if time.Since(start) > maxWait {
 			log.Info(fmt.Sprint("No terminal query responses after ", maxWait, ", giving up"))
-			screen.terminalBackgroundDone = true
-			screen.terminalBackgroundLock.Unlock()
+			screen.terminalQueriesDone = true
+			screen.terminalPropertiesLock.Unlock()
 			return
 		}
 
 		// Unlock so mainLoop() can handle the responses
-		screen.terminalBackgroundLock.Unlock()
+		screen.terminalPropertiesLock.Unlock()
 
 		// It's not more urgent than this
 		time.Sleep(5 * time.Millisecond)
@@ -449,7 +524,7 @@ func (screen *terminalScreen) enterAlternateScreenSessionLocked() {
 	}
 
 	screen.setAlternateScreenModeLocked(true)
-	screen.enableMouseTrackingLocked(screen.shouldEnableMouseTracking())
+	screen.enableMouseTrackingLocked(screen.mouseTracking)
 
 	screen.alternateScreenActive = true
 
@@ -476,16 +551,24 @@ func (screen *terminalScreen) leaveAlternateScreenSessionLocked() {
 	screen.alternateScreenActive = false
 }
 
-func (screen *terminalScreen) shouldEnableMouseTracking() bool {
-	switch screen.mouseMode {
+// Pass terminalHasArrowKeysEmulation() as hasArrowKeysEmulation. It's a
+// parameter so that tests can control it.
+func shouldEnableMouseTracking(mouseMode MouseMode, alternateScroll alternateScrollSupport, hasArrowKeysEmulation func() bool) bool {
+	switch mouseMode {
 	case MouseModeAuto:
-		return !terminalHasArrowKeysEmulation()
+		if alternateScroll == alternateScrollSupported {
+			log.Info("Terminal supports Alternate Scroll Mode, so the mouse wheel will arrive as arrow keys, not enabling mouse tracking")
+			return false
+		}
+
+		log.Info(fmt.Sprint("Terminal Alternate Scroll Mode support is ", alternateScroll, ", checking terminal specifics"))
+		return !hasArrowKeysEmulation()
 	case MouseModeSelect:
 		return false
 	case MouseModeScroll:
 		return true
 	default:
-		panic(fmt.Errorf("unknown mouse mode: %d", screen.mouseMode))
+		panic(fmt.Errorf("unknown mouse mode: %d", mouseMode))
 	}
 }
 
@@ -523,92 +606,53 @@ func (screen *terminalScreen) onWindowResized() {
 func terminalHasArrowKeysEmulation() bool {
 	// Better off with mouse tracking:
 	// * Terminal.app (macOS)
-	// * Contour, thanks to @postsolar (GitHub username) for testing, 2023-12-18
-	// * Foot, thanks to @postsolar (GitHub username) for testing, 2023-12-19
 
-	// Hyper, tested on macOS, December 14th 2023
+	// Hyper 3.4.1, does not support alt scroll mode, so we need to special case
+	// it
 	if os.Getenv("TERM_PROGRAM") == "Hyper" {
 		log.Info("Hyper terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Kitty, tested on macOS, December 14th 2023
+	// Kitty 0.48.2, does not support alt scroll mode, so we need to special
+	// case it
 	if os.Getenv("KITTY_WINDOW_ID") != "" {
 		log.Info("Kitty terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Alacritty, tested on macOS, December 14th 2023
-	if os.Getenv("ALACRITTY_WINDOW_ID") != "" {
-		log.Info("Alacritty terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Warp, tested on macOS, December 14th 2023
+	// Warp v0.2026.09.30.08.29.stable_01, does not support alt scroll mode, so
+	// we need to special case it
 	if os.Getenv("TERM_PROGRAM") == "WarpTerminal" {
 		log.Info("Warp terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// GNOME Terminal, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("GNOME_TERMINAL_SCREEN") != "" {
-		log.Info("GNOME Terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Tilix, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("TILIX_ID") != "" {
-		log.Info("Tilix terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Konsole, tested on Ubuntu 22.04, December 16th 2023
+	// Konsole 25.12.3, does not support alt scroll mode, so we need to special
+	// case it
 	if os.Getenv("KONSOLE_VERSION") != "" {
 		log.Info("Konsole terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Terminator, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("TERMINATOR_UUID") != "" {
-		log.Info("Terminator terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Foot, tested on Ubuntu 22.04, December 16th 2023
-	if os.Getenv("TERM") == "foot" || strings.HasPrefix(os.Getenv("TERM"), "foot-") {
-		// Note that this test isn't very good, somebody could be running Foot
-		// with some other TERM setting. Other suggestions welcome.
-		log.Info("Foot terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Wezterm, tested on MacOS 12.6, January 3rd, 2024
+	// Wezterm 20240203-110809-5046fc22, does not support alt scroll mode, so we
+	// need to special case it
 	if os.Getenv("TERM_PROGRAM") == "WezTerm" {
 		log.Info("Wezterm terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// Rio, tested on macOS 14.3, January 27th, 2024
-	if os.Getenv("TERM_PROGRAM") == "rio" {
-		log.Info("Rio terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// VSCode 1.89.0, tested on macOS 14.4, May 6th, 2024
+	// VSCode 1.140.0 does not support alt scroll mode, so we need to special case it
 	if os.Getenv("TERM_PROGRAM") == "vscode" {
 		log.Info("VSCode terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
-	// IntelliJ IDEA CE 2023.2.2, tested on macOS 14.4, May 6th, 2024
-	if os.Getenv("TERM_PROGRAM") == "JetBrains-JediTerm" {
+	// IntelliJ IDEA CE 2026.2.3, does not support alt scroll mode, so we need
+	// to special case it
+	if os.Getenv("TERM_PROGRAM") == "JetBrains-JediTerm" ||
+		os.Getenv("TERMINAL_EMULATOR") == "JetBrains-JediTerm" {
 		log.Info("IntelliJ IDEA terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// Ghostty 1.0.1, tested on macOS 15.1.1, Jan 12th, 2025
-	if os.Getenv("TERM_PROGRAM") == "ghostty" {
-		log.Info("Ghostty terminal detected, assuming arrow keys emulation active")
 		return true
 	}
 
@@ -616,12 +660,6 @@ func terminalHasArrowKeysEmulation() bool {
 	// https://github.com/walles/moor/issues/53#issuecomment-3276404279
 	if os.Getenv("WT_SESSION") != "" {
 		log.Info("Windows Terminal detected, assuming arrow keys emulation active")
-		return true
-	}
-
-	// iTerm2, supports alternateScroll mode, and therefore works with "select"
-	if os.Getenv("TERM_PROGRAM") == "iTerm.app" {
-		log.Info("iTerm2 terminal detected, gets arrow keys emulation through alternateScroll mode")
 		return true
 	}
 
@@ -706,24 +744,37 @@ func (screen *terminalScreen) processInput(input string) (incomplete string) {
 		}
 
 		if background, ok := (*event).(eventTerminalBackground); ok {
-			screen.terminalBackgroundLock.Lock()
-			if screen.terminalBackgroundDone {
+			screen.terminalPropertiesLock.Lock()
+			if screen.terminalQueriesDone {
 				log.Info(fmt.Sprint("Got the terminal background color ", background.color, " after we stopped waiting for it, ignoring"))
 			} else {
 				screen.terminalBackground = &background.color
-				log.Debug(fmt.Sprint("Terminal background color detected as ", background.color, " after ", time.Since(screen.terminalBackgroundQuery)))
+				log.Debug(fmt.Sprint("Terminal background color detected as ", background.color, " after ", time.Since(screen.terminalQueryTime)))
 			}
-			screen.terminalBackgroundLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
+			continue
+		}
+
+		if alternateScroll, ok := (*event).(eventAlternateScroll); ok {
+			support := alternateScrollSupportFromStatus(alternateScroll.status)
+			screen.terminalPropertiesLock.Lock()
+			if screen.terminalQueriesDone {
+				log.Info(fmt.Sprint("Got Alternate Scroll Mode status ", alternateScroll.status, " (", support, ") after we stopped waiting for it, ignoring"))
+			} else {
+				screen.terminalAlternateScroll = support
+				log.Debug(fmt.Sprint("Alternate Scroll Mode status ", alternateScroll.status, " (", support, ") after ", time.Since(screen.terminalQueryTime)))
+			}
+			screen.terminalPropertiesLock.Unlock()
 			continue
 		}
 
 		if _, ok := (*event).(eventCursorPosition); ok {
-			screen.terminalBackgroundLock.Lock()
-			if !screen.terminalBackgroundDone {
-				log.Debug(fmt.Sprint("Got the cursor position response after ", time.Since(screen.terminalBackgroundQuery), ", done waiting for terminal query responses"))
-				screen.terminalBackgroundDone = true
+			screen.terminalPropertiesLock.Lock()
+			if !screen.terminalQueriesDone {
+				log.Debug(fmt.Sprint("Got the cursor position response after ", time.Since(screen.terminalQueryTime), ", done waiting for terminal query responses"))
+				screen.terminalQueriesDone = true
 			}
-			screen.terminalBackgroundLock.Unlock()
+			screen.terminalPropertiesLock.Unlock()
 			continue
 		}
 
@@ -749,8 +800,7 @@ func (screen *terminalScreen) processInput(input string) (incomplete string) {
 		case screen.events <- *event:
 			// Yay
 		default:
-			// If this happens, consider increasing the channel size in
-			// NewScreen()
+			// If this happens, consider doubling the eventBufferSize constant
 			log.Info(fmt.Sprintf("Events buffer (size %d) full, events are being dropped", cap(screen.events)))
 		}
 	}
@@ -861,6 +911,11 @@ func consumeEncodedEvent(encodedEventSequences string) (*Event, string, bool) {
 
 		if background := parseTerminalBgColorResponse(sequence); background != nil {
 			var event Event = eventTerminalBackground{color: *background}
+			return &event, encodedEventSequences[byteLength:], false
+		}
+
+		if match := alternateScrollResponseRegex.FindStringSubmatch(sequence); match != nil {
+			var event Event = eventAlternateScroll{status: match[1]}
 			return &event, encodedEventSequences[byteLength:], false
 		}
 
@@ -1031,8 +1086,8 @@ func (screen *terminalScreen) applyPendingResize() {
 // NewScreen() waits for background color to be populated. So this method only
 // has to take the lock and return the value.
 func (screen *terminalScreen) TerminalBackground() *Color {
-	screen.terminalBackgroundLock.Lock()
-	defer screen.terminalBackgroundLock.Unlock()
+	screen.terminalPropertiesLock.Lock()
+	defer screen.terminalPropertiesLock.Unlock()
 	return screen.terminalBackground
 }
 
